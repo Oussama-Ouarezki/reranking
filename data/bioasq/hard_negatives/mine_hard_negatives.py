@@ -155,7 +155,7 @@ def score_pairs(ce_tok, ce_model, query: str,
         enc   = {k: v.to(device) for k, v in enc.items()}
         with torch.no_grad():
             logits = ce_model(**enc).logits.squeeze(-1)
-        scores[s:e] = logits.cpu().float().numpy()
+        scores[s:e] = torch.sigmoid(logits).cpu().float().numpy()
     return scores
 
 

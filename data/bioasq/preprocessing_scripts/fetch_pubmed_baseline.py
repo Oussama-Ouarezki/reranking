@@ -1,8 +1,8 @@
 """
 Download and parse the full PubMed annual baseline from NCBI FTP.
 
-Saves the 1,000,000 most-recent documents (highest-numbered baseline files
-processed first) and stops.  Re-running always yields the same 1M docs:
+Saves the 200,000 most-recent documents (highest-numbered baseline files
+processed first) and stops.  Re-running always yields the same 200k docs:
   - files are processed in a fixed reverse-sorted order
   - the corpus count is re-derived from corpus.jsonl on every resume
   - writing stops at exactly DOC_LIMIT documents
@@ -36,7 +36,7 @@ from pathlib import Path
 
 BASELINE_URL = "https://ftp.ncbi.nlm.nih.gov/pubmed/baseline/"
 TIMEOUT      = 180   # seconds per request
-DOC_LIMIT    = 1_000_000  # keep only the most-recent N documents
+DOC_LIMIT    = 200_000  # keep only the most-recent N documents
 
 
 # ── directory listing ─────────────────────────────────────────────────────────
@@ -168,7 +168,22 @@ def run(files: list[str], out_dir: Path, workers: int) -> None:
 
     # Re-derive how many docs already written so resume is always consistent.
     already_written = count_corpus_lines(corpus_path)
-    budget          = DOC_LIMIT - already_written
+
+    # Trim corpus to DOC_LIMIT if it already exceeds the target.
+    if already_written > DOC_LIMIT:
+        print(f"\nCorpus has {already_written:,} documents — trimming to {DOC_LIMIT:,} …")
+        tmp_path = corpus_path.with_suffix('.tmp')
+        with corpus_path.open('r', encoding='utf-8') as src, \
+             tmp_path.open('w', encoding='utf-8') as dst:
+            for i, line in enumerate(src):
+                if i >= DOC_LIMIT:
+                    break
+                dst.write(line)
+        tmp_path.replace(corpus_path)
+        already_written = DOC_LIMIT
+        print(f"  Trimmed. Corpus now has {already_written:,} documents.")
+
+    budget = DOC_LIMIT - already_written
 
     print(f"\nTarget   : {DOC_LIMIT:,} most-recent documents")
     print(f"Written  : {already_written:,}  (budget remaining: {budget:,})")
@@ -176,7 +191,7 @@ def run(files: list[str], out_dir: Path, workers: int) -> None:
           f"({len(remaining):,} remaining)")
 
     if budget <= 0:
-        print(f"Corpus already has ≥ {DOC_LIMIT:,} documents. Nothing to do.")
+        print(f"Corpus already has {DOC_LIMIT:,} documents. Nothing to do.")
         return
     if not remaining:
         print("All files processed but budget not filled — corpus is complete.")

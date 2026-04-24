@@ -44,23 +44,18 @@ def fetch_pubmed_abstracts(pmids, batch_size=200):
                     pmid_node = article.find('.//PMID')
                     if pmid_node is not None:
                         pmid = pmid_node.text
-                        
+
                         title = ""
                         title_node = article.find('.//ArticleTitle')
-                        if title_node is not None and title_node.text:
-                            title = title_node.text
-                            
-                        abstract = ""
-                        abstract_node = article.find('.//AbstractText')
-                        if abstract_node is not None and abstract_node.text:
-                            # Sometimes abstracts have multiple sections. We join them.
-                            abstract_texts = []
-                            for abs_text in article.findall('.//AbstractText'):
-                                if abs_text.text:
-                                    abstract_texts.append(abs_text.text)
-                                # some structured abstracts have labels
-                            abstract = " ".join(abstract_texts)
-                            
+                        if title_node is not None:
+                            title = "".join(title_node.itertext()).strip()
+
+                        abstract_parts = [
+                            "".join(node.itertext()).strip()
+                            for node in article.findall('.//AbstractText')
+                        ]
+                        abstract = " ".join(p for p in abstract_parts if p)
+
                         results[pmid] = (title, abstract)
                         
                 success = True
@@ -134,29 +129,27 @@ def main():
         with open(corpus_file, 'r', encoding='utf-8') as f:
             for line in f:
                 item = json.loads(line)
-                existing_corpus[item['_id']] = item['text']
-                
+                existing_corpus[item['_id']] = {'title': item.get('title', ''), 'text': item['text']}
+
     pmids_to_fetch = unique_pmids - set(existing_corpus.keys())
-    
+
     if pmids_to_fetch:
         fetched_results = fetch_pubmed_abstracts(pmids_to_fetch)
-        # Update existing_corpus
         for pmid, (title, abstract) in fetched_results.items():
-            text = f"{title} {abstract}".strip()
-            existing_corpus[pmid] = text
-            
+            existing_corpus[pmid] = {'title': title, 'text': abstract}
+
         print(f"Total PMIDs successfully fetched from PubMed: {len(fetched_results)}")
-    
+
     # Save corpus
     print("Saving corpus.jsonl...")
     with open(corpus_file, 'w', encoding='utf-8') as f:
         for pmid in unique_pmids:
-            if pmid in existing_corpus and existing_corpus[pmid].strip():
-                # BEIR structure
+            doc = existing_corpus.get(pmid)
+            if doc and doc['text'].strip():
                 json.dump({
                     '_id': pmid,
-                    'title': '',  # We concatenate title and abstract in text
-                    'text': existing_corpus[pmid]
+                    'title': doc['title'],
+                    'text': doc['text']
                 }, f, ensure_ascii=False)
                 f.write('\n')
                 
@@ -176,7 +169,8 @@ def main():
         f.write('query-id\tcorpus-id\tscore\n') # BEIR format
         for q in query_data:
             for pmid in q['train_pmids']:
-                if pmid in existing_corpus and existing_corpus[pmid].strip():
+                doc = existing_corpus.get(pmid)
+                if doc and doc['text'].strip():
                     f.write(f"{q['qid']}\t{pmid}\t1\n")
                     
     # Save qrels test
@@ -185,7 +179,8 @@ def main():
         f.write('query-id\tcorpus-id\tscore\n') # BEIR format
         for q in query_data:
             for pmid in q['test_pmids']:
-                if pmid in existing_corpus and existing_corpus[pmid].strip():
+                doc = existing_corpus.get(pmid)
+                if doc and doc['text'].strip():
                     f.write(f"{q['qid']}\t{pmid}\t1\n")
 
     print("Data preparation complete.")

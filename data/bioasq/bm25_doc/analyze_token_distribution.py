@@ -28,6 +28,11 @@ DOC_DIR   = BASE / 'data' / 'bioasq' / 'processed'
 OUT_DIR   = BASE / 'data' / 'bioasq' / 'bm25_doc'
 TOKENIZER = str(BASE / 'checkpoints' / 'LiT5-Distill-base')
 
+Q_COLORS = {
+    'Q1': '#2ecc71',
+    'Q3': '#9b59b6',
+}
+
 
 def load_token_lengths(path, tokenizer) -> list[int]:
     lengths = []
@@ -37,6 +42,39 @@ def load_token_lengths(path, tokenizer) -> list[int]:
             ids = tokenizer.encode(doc['text'], add_special_tokens=False)
             lengths.append(len(ids))
     return lengths
+
+
+def _add_quartile_lines(ax, lengths, orientation='vertical'):
+    quartiles = {
+        'Q1': np.percentile(lengths, 25),
+        'Q3': np.percentile(lengths, 75),
+    }
+    add_line = ax.axvline if orientation == 'vertical' else ax.axhline
+    for label, val in quartiles.items():
+        add_line(
+            val,
+            color=Q_COLORS[label],
+            linewidth=1.8,
+            linestyle='-.',
+            label=f'{label} = {val:.0f}',
+            zorder=3,
+        )
+    return quartiles
+
+
+def _add_variance_text(ax, lengths, x=0.98, y=0.97):
+    variance = np.var(lengths)
+    std_dev  = np.std(lengths)
+    text = f'Variance : {variance:,.0f}\nStd dev  : {std_dev:.1f}'
+    ax.text(
+        x, y, text,
+        transform=ax.transAxes,
+        ha='right', va='top',
+        fontsize=10,
+        color='#2c3e50',
+        bbox=dict(boxstyle='round,pad=0.4', facecolor='white',
+                  edgecolor='#bdc3c7', alpha=0.85),
+    )
 
 
 def plot_histogram(lengths: list[int], out_path: Path):
@@ -50,13 +88,14 @@ def plot_histogram(lengths: list[int], out_path: Path):
     mean_len = np.mean(lengths)
     ax.axvline(mean_len, color='#e74c3c', linewidth=2,
                linestyle='--', label=f'Mean = {mean_len:.0f}')
-    ax.axvline(np.median(lengths), color='#f39c12', linewidth=2,
-               linestyle=':', label=f'Median = {np.median(lengths):.0f}')
+
+    _add_quartile_lines(ax, lengths, orientation='vertical')
+    _add_variance_text(ax, lengths)
 
     ax.set_title('Token Length Distribution — BioASQ Document Corpus', fontsize=14, pad=12)
     ax.set_xlabel('Token count per document', fontsize=12)
     ax.set_ylabel('Number of documents', fontsize=12)
-    ax.legend(fontsize=11)
+    ax.legend(fontsize=10)
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
@@ -75,17 +114,25 @@ def plot_cumulative(lengths: list[int], out_path: Path):
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.plot(sorted_lens, cumulative, color='steelblue', linewidth=2)
 
-    for pct, color, ls in [(50, '#f39c12', ':'), (90, '#e74c3c', '--'), (95, '#8e44ad', '-.')]:
+    for pct, color, ls in [(90, '#e74c3c', '--'), (95, '#8e44ad', '-.')]:
         val = np.percentile(lengths, pct)
         ax.axvline(val, color=color, linewidth=1.5, linestyle=ls,
                    label=f'P{pct} = {val:.0f} tokens')
         ax.axhline(pct, color=color, linewidth=0.8, linestyle=ls, alpha=0.4)
 
+    quartiles = _add_quartile_lines(ax, lengths, orientation='vertical')
+    for label, val in quartiles.items():
+        pct_level = {'Q1': 25, 'Q3': 75}[label]
+        ax.axhline(pct_level, color=Q_COLORS[label],
+                   linewidth=0.8, linestyle='-.', alpha=0.4)
+
+    _add_variance_text(ax, lengths)
+
     ax.set_title('Cumulative Distribution of Token Lengths — BioASQ Documents',
                  fontsize=14, pad=12)
     ax.set_xlabel('Token count', fontsize=12)
     ax.set_ylabel('% of documents', fontsize=12)
-    ax.legend(fontsize=11)
+    ax.legend(fontsize=10)
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
@@ -104,15 +151,25 @@ def plot_boxplot(lengths: list[int], out_path: Path):
                medianprops=dict(color='#e74c3c', linewidth=2),
                flierprops=dict(marker='.', alpha=0.3, markersize=3))
 
-    for pct in (25, 50, 75, 90, 95):
+    for pct in (90, 95):
         val = np.percentile(lengths, pct)
         ax.axvline(val, color='grey', linewidth=0.8, linestyle='--')
         ax.text(val, 1.38, f'P{pct}\n{val:.0f}', ha='center', va='bottom',
                 fontsize=8, color='#2c3e50')
 
+    for label, val in zip(
+        ['Q1', 'Q3'],
+        [np.percentile(lengths, p) for p in (25, 75)],
+    ):
+        ax.axvline(val, color=Q_COLORS[label], linewidth=1.8,
+                   linestyle='-.', label=f'{label} = {val:.0f}', zorder=4)
+
+    _add_variance_text(ax, lengths, x=0.98, y=0.85)
+
     ax.set_title('Token Length Boxplot — BioASQ Document Corpus', fontsize=14, pad=12)
     ax.set_xlabel('Token count per document', fontsize=12)
     ax.set_yticks([])
+    ax.legend(fontsize=10, loc='upper left')
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
@@ -132,14 +189,15 @@ def main():
 
     arr = np.array(lengths)
     print(f'\n{"─"*40}')
-    print(f'  Min     : {arr.min():,}')
-    print(f'  Max     : {arr.max():,}')
-    print(f'  Mean    : {arr.mean():.1f}')
-    print(f'  Median  : {np.median(arr):.1f}')
-    print(f'  P75     : {np.percentile(arr, 75):.1f}')
-    print(f'  P90     : {np.percentile(arr, 90):.1f}')
-    print(f'  P95     : {np.percentile(arr, 95):.1f}')
-    print(f'  Std dev : {arr.std():.1f}')
+    print(f'  Min      : {arr.min():,}')
+    print(f'  Max      : {arr.max():,}')
+    print(f'  Mean     : {arr.mean():.1f}')
+    print(f'  Q1 (P25) : {np.percentile(arr, 25):.1f}')
+    print(f'  Q3 (P75) : {np.percentile(arr, 75):.1f}')
+    print(f'  P90      : {np.percentile(arr, 90):.1f}')
+    print(f'  P95      : {np.percentile(arr, 95):.1f}')
+    print(f'  Variance : {arr.var():,.1f}')
+    print(f'  Std dev  : {arr.std():.1f}')
     print(f'{"─"*40}')
 
     print('\nGenerating plots...')

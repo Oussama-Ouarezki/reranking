@@ -9,6 +9,7 @@ the most likely top-results are processed multiple times (standard LiT5 setup).
 
 import torch
 from transformers import T5ForConditionalGeneration, T5Tokenizer
+from transformers.modeling_outputs import BaseModelOutput
 
 from .. import config
 
@@ -57,26 +58,40 @@ class LiT5Reranker:
         self.model.eval()
 
     def _rerank_window(self, query: str, window: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        n = len(window)
         strings = [
             f"{QUERY_PREFIX} {query} {PASS_PREFIX} [{i+1}] {text}{SUFFIX}"
             for i, (_, text) in enumerate(window)
         ]
+        # Tokenize each (query, passage) pair independently — TEXT_MAXLENGTH tokens each
         enc = self.tokenizer(
             strings,
             max_length=TEXT_MAXLENGTH,
             padding="max_length",
             truncation=True,
             return_tensors="pt",
-        ).to(self.device)
+        ).to(self.device)  # [n, TEXT_MAXLENGTH]
+
         with torch.no_grad():
+            # FiD: run the encoder on every passage independently, then
+            # concatenate hidden states so the decoder attends to all passages.
+            encoder_out = self.model.encoder(
+                input_ids=enc["input_ids"],           # [n, TEXT_MAXLENGTH]
+                attention_mask=enc["attention_mask"],  # [n, TEXT_MAXLENGTH]
+            )
+            # → [1, n * TEXT_MAXLENGTH, hidden_dim]
+            hidden = encoder_out.last_hidden_state.view(1, n * TEXT_MAXLENGTH, -1)
+            attn_mask = enc["attention_mask"].view(1, n * TEXT_MAXLENGTH)
+
             out = self.model.generate(
-                input_ids=enc["input_ids"],
-                attention_mask=enc["attention_mask"],
+                encoder_outputs=BaseModelOutput(last_hidden_state=hidden),
+                attention_mask=attn_mask,
                 max_new_tokens=MAX_NEW_TOKENS,
                 do_sample=False,
             )
+
         perm_text = self.tokenizer.decode(out[0], skip_special_tokens=True)
-        perm = _parse_ranking(perm_text, len(window))
+        perm = _parse_ranking(perm_text, n)
         return [window[i] for i in perm]
 
     def rerank(

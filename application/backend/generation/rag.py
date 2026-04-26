@@ -30,6 +30,9 @@ def generate_answer(
     docs: list[dict],
     qtype: str,
     history: list[dict] | None = None,
+    num_ctx: int | None = None,
 ) -> str:
     msgs = prompts.build_messages(question, docs, qtype, history)
-    return ollama_client.chat(msgs, temperature=0.2, max_tokens=512)
+    return ollama_client.chat(
+        msgs, temperature=0.2, max_tokens=512, num_ctx=num_ctx
+    )

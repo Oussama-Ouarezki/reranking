@@ -20,7 +20,7 @@ class BM25Retriever:
         self.k1 = k1
         self.b = b
 
-    def search(self, query: str, k: int = 100):
+    def search(self, query: str, k: int = 50):
         """Return list of {docid, score, rank} dicts."""
         hits = self.searcher.search(query, k=k)
         return [

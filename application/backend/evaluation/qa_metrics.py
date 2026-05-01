@@ -150,6 +150,95 @@ def list_f1(pred: str, gold_groups: list[list[str]]) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
+# ---------------------------------------------------------------- ROUGE-L (no external deps)
+
+
+def _lcs_length(a: list[str], b: list[str]) -> int:
+    m, n = len(a), len(b)
+    if m == 0 or n == 0:
+        return 0
+    prev = [0] * (n + 1)
+    for i in range(1, m + 1):
+        curr = [0] * (n + 1)
+        for j in range(1, n + 1):
+            if a[i - 1] == b[j - 1]:
+                curr[j] = prev[j - 1] + 1
+            else:
+                curr[j] = max(curr[j - 1], prev[j])
+        prev = curr
+    return prev[n]
+
+
+def rouge_l_score(pred: str, ideals: list[str]) -> float:
+    """ROUGE-L F1 between pred and the best-matching ideal (token-level LCS)."""
+    if not pred or not ideals:
+        return 0.0
+    pred_toks = tokenize(pred)
+    if not pred_toks:
+        return 0.0
+    best = 0.0
+    for ideal in ideals:
+        ref_toks = tokenize(ideal)
+        if not ref_toks:
+            continue
+        lcs = _lcs_length(pred_toks, ref_toks)
+        p = lcs / len(pred_toks)
+        r = lcs / len(ref_toks)
+        f1 = (2 * p * r / (p + r)) if (p + r) > 0 else 0.0
+        best = max(best, f1)
+    return round(best, 4)
+
+
+# ---------------------------------------------------------------- BERTScore (optional)
+
+
+def bert_score_f1(pred: str, ideals: list[str]) -> float | None:
+    """BERTScore F1 (max over ideals). Returns None if bert-score is not installed."""
+    if not pred or not ideals:
+        return None
+    try:
+        from bert_score import score as _bs  # type: ignore
+    except ImportError:
+        return None
+    try:
+        _, _, f1 = _bs([pred] * len(ideals), ideals, lang="en", verbose=False)
+        return round(float(f1.max().item()), 4)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------- yesno extras
+
+
+def extract_yesno_label(pred: str) -> str | None:
+    """Extract 'yes' or 'no' from a prediction string (first occurrence wins)."""
+    yes_at = _YES_RE.search(pred)
+    no_at = _NO_RE.search(pred)
+    if yes_at and (not no_at or yes_at.start() < no_at.start()):
+        return "yes"
+    if no_at:
+        return "no"
+    return None
+
+
+def yesno_macro_f1(pairs: list[tuple[str | None, str]]) -> float:
+    """Macro-averaged F1 for binary yes/no over (pred_label, gold_label) pairs."""
+    if not pairs:
+        return 0.0
+
+    def _f1(cls: str) -> float:
+        tp = sum(1 for p, g in pairs if p == cls and g == cls)
+        fp = sum(1 for p, g in pairs if p == cls and g != cls)
+        fn = sum(1 for p, g in pairs if p != cls and g == cls)
+        if tp == 0:
+            return 0.0
+        pr = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        re = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        return (2 * pr * re / (pr + re)) if (pr + re) > 0 else 0.0
+
+    return round((_f1("yes") + _f1("no")) / 2, 4)
+
+
 # ---------------------------------------------------------------- summary (LLM-judge)
 
 
@@ -259,6 +348,56 @@ def score_answer(qtype: str, pred: str, query: dict[str, object]) -> float | Non
         return summary_judge_binary(str(question), pred, ideals)
 
     return None
+
+
+def score_answer_full(
+    qtype: str,
+    pred: str,
+    query: dict[str, object],
+    skip_judge: bool = False,
+) -> dict[str, object]:
+    """Return all available metrics for a qtype as a dict.
+
+    Always includes 'qa_score' (same scalar as score_answer()).
+    Extra keys per type:
+      yesno   → 'pred_label', 'gold_label'  (for aggregate macro F1)
+      summary → 'rouge_l', 'bert_score'
+                'qa_score' is None when skip_judge=True (LLM judge skipped)
+    """
+    result: dict[str, object] = {"qa_score": None}
+    if not pred:
+        return result
+    qtype = (qtype or "").lower()
+
+    if qtype == "factoid":
+        groups = _coerce_groups(query.get("exact_answer"))
+        if groups:
+            result["qa_score"] = factoid_mrr(pred, groups)
+
+    elif qtype == "yesno":
+        gold = query.get("exact_answer")
+        if isinstance(gold, list) and gold:
+            gold = gold[0]
+        if isinstance(gold, str):
+            result["qa_score"] = yesno_accuracy(pred, gold)
+            result["pred_label"] = extract_yesno_label(pred)
+            result["gold_label"] = gold.strip().lower()
+
+    elif qtype == "list":
+        groups = _coerce_groups(query.get("exact_answer"))
+        if groups:
+            result["qa_score"] = list_f1(pred, groups)
+
+    elif qtype == "summary":
+        ideals = _coerce_ideals(query.get("ideal_answer"))
+        question = str(query.get("text") or query.get("body") or "")
+        if ideals:
+            if not skip_judge:
+                result["qa_score"] = summary_judge_binary(question, pred, ideals)
+            result["rouge_l"] = rouge_l_score(pred, ideals)
+            result["bert_score"] = bert_score_f1(pred, ideals)
+
+    return result
 
 
 def aggregate_qa_scores(

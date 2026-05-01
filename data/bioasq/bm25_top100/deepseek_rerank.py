@@ -1,5 +1,6 @@
 """
-Pass top-20 BM25 PubMed abstracts per query to DeepSeek for listwise ranking.
+Pass top-20 BM25 documents per query to DeepSeek for listwise ranking.
+Used to generate distillation labels for LiT5-Distill fine-tuning on BioASQ.
 
 Reads:
   data/bioasq/bm25_top100/bm25_top100_ids.jsonl
@@ -10,20 +11,20 @@ Writes:
 
 Output per query:
   {
-    "qid":        "...",
-    "bm25_order": ["docid1", ..., "docid20"],   # original BM25 order
-    "permutation": ["docid3", "docid1", ...],   # DeepSeek order (best first)
+    "qid":           "...",
+    "query":         "...",
+    "bm25_top20":    ["docid1", ..., "docid20"],
+    "reranked":      ["docid3", "docid1", ...],
+    "raw_response":  "...",
+    "n_prompt_tokens": int,
+    "missing_docids": [...]   # docids not found in corpus (should be empty)
   }
-
-Supports resume: re-running skips queries already written to the output file.
 
 Usage:
     export DEEPSEEK_API_KEY="sk-..."
     cd /home/oussama/Desktop/reranking_project
     /home/oussama/miniconda3/envs/pyml/bin/python \\
-        data/bioasq/bm25_top100/deepseek_rerank.py --n-queries 10
-    /home/oussama/miniconda3/envs/pyml/bin/python \\
-        data/bioasq/bm25_top100/deepseek_rerank.py          # all 2000
+        data/bioasq/bm25_top100/deepseek_rerank.py --n-queries 1 --verbose
 """
 
 import argparse
@@ -33,116 +34,132 @@ import re
 import time
 from pathlib import Path
 
+import tiktoken
 from openai import OpenAI
 from tqdm import tqdm
 
 BASE     = Path(__file__).resolve().parents[3]
 IDS_FILE = BASE / "data/bioasq/bm25_top100/bm25_top100_ids.jsonl"
 CORPUS   = BASE / "data/bioasq/pubmed_full/full/corpus_full_processed.jsonl"
-OUT_FILE = BASE / "data/bioasq/bm25_top100/deepseek_reranked_20.jsonl"
+OUT_FILE = BASE / "data/bioasq/bm25_top100/deepseek_reranked_512.jsonl"
 
-TOP_N = 20
-MODEL = "deepseek-reasoner"
+TOP_N             = 20
+MODEL             = "deepseek-chat"
+PASSAGE_TOKEN_CAP = 512          # per-passage truncation
 
+# tiktoken has no DeepSeek encoder but cl100k_base is a close proxy
+# (DeepSeek's tokenizer vocabulary is similar enough for length estimation)
+TOKENIZER = tiktoken.get_encoding("cl100k_base")
+
+
+# RankGPT-style prompt — this is the format LiT5-Distill was trained with
 SYSTEM_PROMPT = (
-    "You are an expert biomedical reranker specializing in PubMed literature. "
-    "Given a biomedical question and a numbered list of PubMed abstracts with their BM25 "
-    "lexical relevance scores, rank all abstracts from most to least relevant to the question. "
-    "Use both the BM25 score (lexical match signal) and the semantic content to determine relevance. "
-    "Respond with a JSON object with a single key \"ranking\" whose value is a list of ALL "
-    "document numbers in order, best first. "
-    "Example for 5 documents: {\"ranking\": [3, 1, 5, 2, 4]}"
+    "You are RankLLM, an intelligent assistant that ranks biomedical passages "
+    "based on their relevance to a query."
+)
+
+PRE_PROMPT = (
+    "I will provide you with {n} passages, each indicated by a numerical identifier []. "
+    "Rank the passages based on their relevance to the biomedical query: {query}"
+)
+
+POST_PROMPT = (
+    "Biomedical query: {query}\n\n"
+    "Rank the {n} passages above based on their relevance to the query. "
+    "The passages should be listed in descending order of relevance, using their "
+    "identifiers. The most relevant passages should be listed first. "
+    "The output format should be [] > [] > ..., e.g., [4] > [2] > [1] > [3]. "
+    "Only respond with the ranking results, do not say anything else or explain."
 )
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def truncate_doc(title: str, text: str, max_words: int = 512) -> str:
-    passage = f"{title}. {text}".strip() if title else text.strip()
-    words = passage.split()
-    if len(words) <= max_words:
-        return passage
-    return " ".join(words[:max_words]) + " [...]"
+def truncate_to_tokens(text: str, max_tokens: int) -> str:
+    """Truncate text to approximately max_tokens using cl100k_base tokenizer."""
+    tokens = TOKENIZER.encode(text)
+    if len(tokens) <= max_tokens:
+        return text
+    return TOKENIZER.decode(tokens[:max_tokens])
 
 
-def build_user_prompt(query: str, docs: list[dict], bm25_scores: list[float]) -> str:
-    lines = [f"Biomedical question: {query}\n\nPubMed abstracts:"]
-    for i, (doc, score) in enumerate(zip(docs, bm25_scores), start=1):
-        passage = truncate_doc(doc["title"], doc["text"])
-        lines.append(f"[{i}] BM25: {score:.1f} | {passage}")
-    lines.append(
-        f"\nRank all {len(docs)} abstracts from most to least relevant to the question above. "
-        f"Combine BM25 lexical scores and semantic relevance. "
-        f"Return a JSON object with key \"ranking\" containing all numbers 1 through "
-        f"{len(docs)} exactly once, best first."
+def count_tokens(text: str) -> int:
+    return len(TOKENIZER.encode(text))
+
+
+def build_messages(query: str, docs: list[dict]) -> tuple[list[dict], int]:
+    """Build the full message list and return (messages, total_prompt_tokens)."""
+    n = len(docs)
+
+    # Format each passage: title + abstract, truncated to 512 tokens
+    passage_blocks = []
+    for i, doc in enumerate(docs, start=1):
+        title = doc["title"].strip()
+        text  = doc["text"].strip()
+        passage = f"{title}\n{text}" if title else text
+        passage = truncate_to_tokens(passage, PASSAGE_TOKEN_CAP)
+        passage_blocks.append(f"[{i}] {passage}")
+
+    user_content = (
+        PRE_PROMPT.format(n=n, query=query)
+        + "\n\n"
+        + "\n\n".join(passage_blocks)
+        + "\n\n"
+        + POST_PROMPT.format(n=n, query=query)
     )
-    return "\n".join(lines)
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": user_content},
+    ]
+
+    total_tokens = count_tokens(SYSTEM_PROMPT) + count_tokens(user_content)
+    return messages, total_tokens
 
 
-def _coerce_int(x) -> int | None:
-    if isinstance(x, int):
-        return x
-    if isinstance(x, float) and x == int(x):
-        return int(x)
-    if isinstance(x, str) and x.strip().isdigit():
-        return int(x.strip())
-    return None
+def parse_ranking(raw: str, n: int) -> list[int] | None:
+    """
+    Extract a ranked list of 1-based ints from the model response.
+    Handles two formats:
+      1. RankGPT-style:  [3] > [1] > [7] > [2] ...
+      2. JSON-array fallback: [3, 1, 7, 2, ...]
+    Appends any missing indices at the end (tail of BM25 order would be better,
+    but we don't have access to the original order here — caller handles that).
+    """
+    # Try RankGPT format first
+    bracket_nums = re.findall(r"\[(\d+)\]", raw)
+    ranking: list[int] = []
+    if bracket_nums:
+        for s in bracket_nums:
+            try:
+                ranking.append(int(s))
+            except ValueError:
+                pass
 
+    # Fallback: JSON array
+    if not ranking:
+        match = re.search(r"\[[\d\s,]+\]", raw)
+        if match:
+            try:
+                ranking = [int(x) for x in json.loads(match.group())]
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return None
 
-def _clean(seq: list, n: int) -> list[int]:
+    if not ranking:
+        return None
+
+    # Deduplicate and keep only valid 1-based indices
     seen: set[int] = set()
-    result: list[int] = []
-    for raw_x in seq:
-        x = _coerce_int(raw_x)
-        if x is not None and 1 <= x <= n and x not in seen:
-            result.append(x)
+    clean: list[int] = []
+    for x in ranking:
+        if 1 <= x <= n and x not in seen:
+            clean.append(x)
             seen.add(x)
+
+    # Append any missing indices in original order
     for i in range(1, n + 1):
         if i not in seen:
-            result.append(i)
-    return result
+            clean.append(i)
 
-
-def parse_ranking(raw: str, n: int) -> list[int]:
-    """
-    Extract a permutation of 1..n from the model response.
-    Strategy 1: JSON object with "ranking" / "ranked" / "order" key.
-    Strategy 2: Last bracket array with >= n//2 items (skips [16]-style commentary).
-    Strategy 3: Scrape all 1-2 digit integers from text in order.
-    Fallback:   Identity (BM25 order unchanged).
-    Always returns a complete list of length n.
-    """
-    # Strategy 1 — JSON object (JSON mode response)
-    try:
-        obj = json.loads(raw)
-        if isinstance(obj, dict):
-            for key in ("ranking", "ranked", "order", "result"):
-                if key in obj and isinstance(obj[key], list):
-                    return _clean(obj[key], n)
-            for val in obj.values():
-                if isinstance(val, list):
-                    return _clean(val, n)
-        if isinstance(obj, list):
-            return _clean(obj, n)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        pass
-
-    # Strategy 2 — last valid bracket array with enough items
-    for m in reversed(list(re.finditer(r'\[[\d\s.,\"\']+\]', raw))):
-        try:
-            arr = json.loads(m.group())
-            if isinstance(arr, list) and len(arr) >= n // 2:
-                return _clean(arr, n)
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-    # Strategy 3 — scrape integers from text
-    nums = [int(x) for x in re.findall(r'\b([1-9][0-9]?)\b', raw) if int(x) <= n]
-    if nums:
-        return _clean(nums, n)
-
-    # Fallback — identity
-    return list(range(1, n + 1))
+    return clean if len(clean) == n else None
 
 
 def load_corpus_subset(docids: set[str]) -> dict[str, dict]:
@@ -155,39 +172,28 @@ def load_corpus_subset(docids: set[str]) -> dict[str, dict]:
                     "title": doc.get("title", ""),
                     "text":  doc["text"],
                 }
-            if len(corpus) == len(docids):
-                break
     return corpus
 
 
-def load_done_qids(path: Path) -> set[str]:
-    done: set[str] = set()
-    if path.exists():
-        with path.open() as f:
-            for line in f:
-                try:
-                    done.add(json.loads(line)["qid"])
-                except (json.JSONDecodeError, KeyError):
-                    pass
-    return done
-
-
-def call_api(client, model: str, messages: list) -> str:
+def call_deepseek(client, model, messages):
     resp = client.chat.completions.create(
         model=model,
         messages=messages,
-        temperature=1,   # required for deepseek-reasoner
+        temperature=0,
+        max_tokens=300,
     )
     return resp.choices[0].message.content or ""
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n-queries", type=int, default=None,
-                        help="Max queries to process. Omit to process all 2000.")
+    parser.add_argument("--n-queries", type=int, default=10,
+                        help="Number of queries to process")
     parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print full prompt and raw response (useful for n=1 testing)")
+    parser.add_argument("--output", default=str(OUT_FILE),
+                        help="Output path (default: deepseek_reranked.jsonl)")
     args = parser.parse_args()
 
     api_key = os.environ.get("DEEPSEEK_API_KEY")
@@ -195,69 +201,86 @@ def main() -> None:
         raise SystemExit("Set DEEPSEEK_API_KEY environment variable first.")
 
     client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+    out_path = Path(args.output)
 
-    # ── Load queries ───────────────────────────────────────────────────────────
+    # Load queries
     records = []
     with IDS_FILE.open() as f:
         for line in f:
             records.append(json.loads(line))
-    if args.n_queries:
-        records = records[:args.n_queries]
+            if len(records) == args.n_queries:
+                break
+    print(f"Loaded {len(records)} queries")
 
-    # ── Resume: skip already-done queries ─────────────────────────────────────
-    OUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    done_qids = load_done_qids(OUT_FILE)
-    if done_qids:
-        print(f"Resuming: {len(done_qids)} queries already done, skipping.")
-    records = [r for r in records if r["qid"] not in done_qids]
-    print(f"{len(records)} queries to process  |  model: {args.model}")
-
-    if not records:
-        print("Nothing to do.")
-        return
-
-    # ── Load passage texts ─────────────────────────────────────────────────────
-    needed = {h["docid"] for r in records for h in r["top100"][:TOP_N]}
+    # Collect all needed docids and load their text
+    needed = {d["docid"] for r in records for d in r["top100"][:TOP_N]}
     print(f"Loading {len(needed)} documents from corpus …")
     corpus = load_corpus_subset(needed)
-    missing = len(needed) - len(corpus)
-    if missing:
-        print(f"  Warning: {missing} docids not found in corpus (will appear as empty)")
-    print(f"  {len(corpus)} found")
+    print(f"  {len(corpus)} found ({len(needed) - len(corpus)} missing)")
 
-    # ── Rerank ─────────────────────────────────────────────────────────────────
-    n_ok = n_fail = 0
+    # Rerank
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    n_ok = n_fail = n_parse_fail = 0
+    token_counts = []
 
-    with OUT_FILE.open("a") as out:
+    with out_path.open("w") as out:
         for rec in tqdm(records, desc="Reranking"):
-            top20      = rec["top100"][:TOP_N]
-            top20_ids  = [h["docid"] for h in top20]
-            bm25_scores = [h["score"] for h in top20]
-            docs       = [corpus.get(did, {"title": "", "text": ""}) for did in top20_ids]
-            messages   = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": build_user_prompt(rec["query"], docs, bm25_scores)},
-            ]
+            top20_ids = [d["docid"] for d in rec["top100"][:TOP_N]]
+            missing = [did for did in top20_ids if did not in corpus]
+            docs = [corpus.get(did, {"title": "", "text": ""}) for did in top20_ids]
+
+            messages, n_tokens = build_messages(rec["query"], docs)
+            token_counts.append(n_tokens)
+
+            if args.verbose:
+                print(f"\n{'='*70}")
+                print(f"QID: {rec['qid']}")
+                print(f"Query: {rec['query']}")
+                print(f"Prompt tokens: {n_tokens}")
+                print(f"Missing docids: {missing}")
+                print(f"\n--- USER MESSAGE (first 2000 chars) ---")
+                print(messages[1]["content"][:2000])
+                print(f"... [truncated, total {len(messages[1]['content'])} chars]")
 
             try:
-                raw      = call_api(client, args.model, messages)
-                ranking  = parse_ranking(raw, TOP_N)
-                permutation = [top20_ids[i - 1] for i in ranking]
-                n_ok    += 1
+                raw = call_deepseek(client, args.model, messages)
+                ranking = parse_ranking(raw, TOP_N)
+                if ranking is None:
+                    reranked_ids = top20_ids
+                    n_parse_fail += 1
+                    print(f"\n  [PARSE FAIL] {rec['qid']}: {raw[:200]}")
+                else:
+                    reranked_ids = [top20_ids[i - 1] for i in ranking]
+                    n_ok += 1
             except Exception as e:
-                print(f"\n  [FAIL] {rec['qid']}: {e}")
-                permutation = top20_ids
-                n_fail     += 1
+                print(f"\n  [API FAIL] {rec['qid']}: {e}")
+                raw = ""
+                reranked_ids = top20_ids
+                n_fail += 1
+
+            if args.verbose:
+                print(f"\n--- RAW RESPONSE ---")
+                print(raw)
+                print(f"\n--- RERANKED ORDER ---")
+                print(reranked_ids)
 
             out.write(json.dumps({
-                "qid":         rec["qid"],
-                "bm25_order":  top20_ids,
-                "permutation": permutation,
+                "qid":             rec["qid"],
+                "query":           rec["query"],
+                "bm25_top20":      top20_ids,
+                "reranked":        reranked_ids,
+                "raw_response":    raw,
+                "n_prompt_tokens": n_tokens,
+                "missing_docids":  missing,
             }, ensure_ascii=False) + "\n")
 
-            time.sleep(0.3)
+            time.sleep(0.3)  # rate limit
 
-    print(f"\nDone — {n_ok} ok, {n_fail} failed → {OUT_FILE}")
+    if token_counts:
+        avg_tok = sum(token_counts) / len(token_counts)
+        max_tok = max(token_counts)
+        print(f"\nPrompt tokens — avg: {avg_tok:.0f}, max: {max_tok}")
+    print(f"Done — {n_ok} ok, {n_parse_fail} parse-fail, {n_fail} api-fail → {out_path}")
 
 
 if __name__ == "__main__":

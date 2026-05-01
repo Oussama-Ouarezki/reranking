@@ -18,7 +18,7 @@ TOKEN_TRUE = "▁true"
 TOKEN_FALSE = "▁false"
 
 MAX_LENGTH = 1024
-DOC_MAX_TOKENS = 200
+DOC_MAX_TOKENS = 350
 TOURNAMENT_TOP_N = 20
 
 
@@ -30,7 +30,7 @@ def _truncate_doc(text: str, max_tokens: int = DOC_MAX_TOKENS) -> str:
 class DuoT5Reranker:
     name = "duot5"
 
-    def __init__(self, checkpoint=None, batch_size: int = 4, device: str | None = None):
+    def __init__(self, checkpoint=None, batch_size: int = 16, device: str | None = None):
         self.checkpoint = str(checkpoint or config.CHECKPOINTS["duot5"])
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.batch_size = batch_size

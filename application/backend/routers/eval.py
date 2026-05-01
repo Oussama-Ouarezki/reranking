@@ -12,12 +12,13 @@ returns the full payload.
 
 import asyncio
 import json
+import random
 import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Body, HTTPException, WebSocket, WebSocketDisconnect
 
 from .. import config, deps
 from ..rerankers import registry as rerank_registry
@@ -28,6 +29,16 @@ router = APIRouter()
 # Top-N passages saved per query (caps generation k).
 SAVE_TOPN = 20
 RUNS_DIR = config.CACHE_DIR / "runs"
+SAMPLE_SEED = 42
+
+
+def _sample_queries(queries: list[dict], n: int | None) -> list[dict]:
+    """Deterministic sample of N queries (seed=42). n=None or n>=len → no sampling."""
+    if n is None or n <= 0 or n >= len(queries):
+        return queries
+    rng = random.Random(SAMPLE_SEED)
+    idxs = sorted(rng.sample(range(len(queries)), n))
+    return [queries[i] for i in idxs]
 
 
 # ---------- run-file helpers --------------------------------------------------
@@ -74,6 +85,7 @@ def _list_runs() -> list[dict]:
                 "config": d.get("config"),
                 "elapsed_s": d.get("elapsed_s"),
                 "n_queries": len(d.get("per_query", {})),
+                "comment": d.get("comment", ""),
             })
     out.sort(key=lambda r: r.get("ended_at") or 0, reverse=True)
     return out
@@ -124,6 +136,137 @@ def get_run(run_id: str):
     if d is None:
         raise HTTPException(status_code=404, detail="run not found")
     return d
+
+
+@router.patch("/eval/runs/{run_id}")
+def update_run(run_id: str, body: dict = Body(...)):
+    """Update mutable fields on a retrieval run. Currently only ``comment``."""
+    if "comment" not in body:
+        raise HTTPException(status_code=400, detail="only 'comment' is patchable")
+    comment = str(body["comment"])
+    if not RUNS_DIR.exists():
+        raise HTTPException(status_code=404, detail="run not found")
+    for model_dir in RUNS_DIR.iterdir():
+        if not model_dir.is_dir():
+            continue
+        for f in model_dir.glob("*.json"):
+            try:
+                with open(f) as fh:
+                    d = json.load(fh)
+            except Exception:
+                continue
+            if d.get("run_id") == run_id or f.stem == run_id:
+                d["comment"] = comment
+                with open(f, "w") as fh:
+                    json.dump(d, fh)
+                return {"ok": True, "comment": comment}
+    raise HTTPException(status_code=404, detail="run not found")
+
+
+METRIC_KEYS = ("ndcg_at", "mrr_at", "p_at", "r_at", "map_at")
+DEFAULT_DIFF_KS = (1, 5, 10, 20)
+
+
+def _per_query_qtype_means(run: dict, qids: set[str]) -> dict[str, dict[str, dict[int, float]]]:
+    """Aggregate per-query metrics by qtype over the given qid subset.
+
+    Returns: {qtype: {metric: {k: mean_value}}}.
+    """
+    bucket: dict[str, dict[str, dict[int, list[float]]]] = {}
+    for qid, entry in (run.get("per_query") or {}).items():
+        if qid not in qids:
+            continue
+        m = entry.get("metrics")
+        qtype = entry.get("qtype")
+        if not m or not qtype:
+            continue
+        per_metric = bucket.setdefault(qtype, {k: {} for k in METRIC_KEYS})
+        for mk in METRIC_KEYS:
+            for k, v in (m.get(mk) or {}).items():
+                # JSON keys are strings; coerce.
+                k_int = int(k)
+                per_metric[mk].setdefault(k_int, []).append(float(v))
+
+    out: dict[str, dict[str, dict[int, float]]] = {}
+    for qtype, mmap in bucket.items():
+        out[qtype] = {}
+        for mk, kmap in mmap.items():
+            out[qtype][mk] = {k: round(sum(vs) / len(vs), 4) for k, vs in kmap.items() if vs}
+    return out
+
+
+def _global_means(run: dict, qids: set[str]) -> dict[str, dict[int, float]]:
+    bucket: dict[str, dict[int, list[float]]] = {mk: {} for mk in METRIC_KEYS}
+    for qid, entry in (run.get("per_query") or {}).items():
+        if qid not in qids:
+            continue
+        m = entry.get("metrics")
+        if not m:
+            continue
+        for mk in METRIC_KEYS:
+            for k, v in (m.get(mk) or {}).items():
+                k_int = int(k)
+                bucket[mk].setdefault(k_int, []).append(float(v))
+    return {
+        mk: {k: round(sum(vs) / len(vs), 4) for k, vs in kmap.items() if vs}
+        for mk, kmap in bucket.items()
+    }
+
+
+def _diff(a: dict, b: dict) -> dict:
+    """Cell-wise (a - b) over the same {metric: {k: value}} shape."""
+    out: dict[str, dict[int, float]] = {}
+    for mk in a:
+        kmap_a = a[mk]
+        kmap_b = b.get(mk, {})
+        out[mk] = {
+            k: round(kmap_a[k] - kmap_b.get(k, 0.0), 4)
+            for k in kmap_a
+            if k in kmap_b
+        }
+    return out
+
+
+@router.get("/eval/runs/{run_id}/diff")
+def diff_run(run_id: str, baseline: str):
+    """Return per-qtype + global metric deltas of run_id vs baseline.
+
+    Both runs must be loadable. Comparison is made over the *intersection* of
+    qids that appear in both runs (so comparisons are fair even when one run
+    used a different sample size).
+    """
+    a = _load_run(run_id)
+    if a is None:
+        raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
+    b = _load_run(baseline)
+    if b is None:
+        raise HTTPException(status_code=404, detail=f"baseline not found: {baseline}")
+
+    qids = set((a.get("per_query") or {}).keys()) & set((b.get("per_query") or {}).keys())
+    if not qids:
+        raise HTTPException(status_code=400, detail="no overlapping qids between runs")
+
+    a_global = _global_means(a, qids)
+    b_global = _global_means(b, qids)
+    a_qtype = _per_query_qtype_means(a, qids)
+    b_qtype = _per_query_qtype_means(b, qids)
+
+    by_qtype = {
+        qtype: {
+            "a": a_qtype.get(qtype, {}),
+            "b": b_qtype.get(qtype, {}),
+            "delta": _diff(a_qtype.get(qtype, {}), b_qtype.get(qtype, {})),
+        }
+        for qtype in set(a_qtype) | set(b_qtype)
+    }
+
+    return {
+        "run_id": run_id,
+        "baseline": baseline,
+        "n_overlapping": len(qids),
+        "global": {"a": a_global, "b": b_global, "delta": _diff(a_global, b_global)},
+        "by_qtype": by_qtype,
+    }
 
 
 @router.delete("/eval/runs/{run_id}")
@@ -196,11 +339,15 @@ async def eval_run(ws: WebSocket):
         return
 
     models: list[str] = cfg_msg.get("models", ["bm25"])
+    n_questions: int | None = cfg_msg.get("n_questions")
+    comment: str = str(cfg_msg.get("comment", "") or "")
 
     bm25 = deps.get_bm25()
     corpus = deps.get_corpus()
     qrels = deps.get_qrels()
-    queries = deps.get_queries()
+    all_queries = deps.get_queries()
+    queries = _sample_queries(all_queries, n_questions)
+    sampled_qids = [q["_id"] for q in queries]
     total_queries = len(queries)
 
     started_at = time.time()
@@ -209,7 +356,7 @@ async def eval_run(ws: WebSocket):
 
     try:
         for model_name in models:
-            if model_name not in {"bm25", "monot5", "duot5", "lit5", "mono_duo"}:
+            if model_name not in rerank_registry.eval_models():
                 await ws.send_json({"type": "error", "message": f"unknown model {model_name}"})
                 continue
 
@@ -262,7 +409,14 @@ async def eval_run(ws: WebSocket):
                 "started_at": t0,
                 "ended_at": ended_at,
                 "elapsed_s": elapsed,
-                "config": {"save_topn": SAVE_TOPN},
+                "config": {
+                    "save_topn": SAVE_TOPN,
+                    "bm25_retrieve_k": config.BM25_RETRIEVE_K,
+                    "n_questions": total_queries,
+                    "sampled_qids": sampled_qids if n_questions else None,
+                    "seed": SAMPLE_SEED if n_questions else None,
+                },
+                "comment": comment,
                 "aggregate": agg,
                 "per_query": per_query_model,
             }
@@ -286,7 +440,12 @@ async def eval_run(ws: WebSocket):
         results = {
             "started_at": started_at,
             "ended_at": time.time(),
-            "config": {"models": models, "save_topn": SAVE_TOPN},
+            "config": {
+                "models": models,
+                "save_topn": SAVE_TOPN,
+                "bm25_retrieve_k": config.BM25_RETRIEVE_K,
+                "n_questions": total_queries,
+            },
             "per_model": summary_per_model,
             "saved_run_ids": saved_run_ids,
         }

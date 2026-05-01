@@ -16,7 +16,7 @@ TOKEN_FALSE = "▁false"
 class MonoT5Reranker:
     name = "monot5"
 
-    def __init__(self, checkpoint=None, batch_size: int = 8, device: str | None = None):
+    def __init__(self, checkpoint=None, batch_size: int = 50, device: str | None = None):
         self.checkpoint = str(checkpoint or config.CHECKPOINTS["monot5"])
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.batch_size = batch_size
@@ -40,7 +40,7 @@ class MonoT5Reranker:
             inputs,
             padding=True,
             truncation=True,
-            max_length=512,
+            max_length=350,
             return_tensors="pt",
         ).to(self.device)
         decoder_input = torch.zeros((len(inputs), 1), dtype=torch.long, device=self.device)

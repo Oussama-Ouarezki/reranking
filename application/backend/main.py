@@ -14,6 +14,8 @@ from .routers import generation as generation_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("rag-app")
+# show per-query margin diagnostics from the dynamic cascade
+logging.getLogger("application.backend.rerankers.cascade").setLevel(logging.DEBUG)
 
 
 @asynccontextmanager

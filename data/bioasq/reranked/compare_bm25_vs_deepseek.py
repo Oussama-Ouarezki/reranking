@@ -26,7 +26,7 @@ BASE        = Path(__file__).resolve().parents[3]
 QRELS       = BASE / "data/bioasq/processed/qrels.tsv"
 QUERIES     = BASE / "data/bioasq/processed/queries.jsonl"
 BM25_FILE   = BASE / "data/bioasq/bm25_top100/bm25_top100_ids.jsonl"
-DS_FILE     = BASE / "data/bioasq/bm25_top100/deepseek_sliding_reranked_prompt_2.jsonl"
+DS_FILE     = BASE / "data/bioasq/reranked/deepseek_sliding_reranked_prompt_2.jsonl"
 OUT_ALL     = BASE / "data/bioasq/reranked/per_query_results.txt"
 OUT_TYPE    = BASE / "data/bioasq/reranked/per_type_results.txt"
 

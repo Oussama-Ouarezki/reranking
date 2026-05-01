@@ -8,12 +8,15 @@ MonoDynamicDuoLiT5       — BM25 → monoT5 (rank all) → duoT5 on docs whose
                             adjacent score gap < margin → LiT5 top-20
 MonoGatedDuoCascade      — BM25 → monoT5 (rank all) → duoT5 tournament on
                             top-20 only when top-1/top-2 score gap < τ=0.001
+MonoEntropyGatedDuoCascade — BM25 → monoT5 (rank all) → duoT5 on top-20 only
+                            when rank-distribution entropy H@20 ≥ τ=0.950
 
 Final scores are synthetic descending integers so the global ordering is
 preserved for downstream metrics (nDCG, MAP, MRR, etc.).
 """
 
 import logging
+import math
 
 from .duot5 import TOURNAMENT_TOP_N
 from . import registry
@@ -640,3 +643,208 @@ class MonoGatedLiT5Top50(MonoGatedLiT5Cascade):
 
     def __init__(self) -> None:
         super().__init__(margin=0.001, top_k=50)
+
+
+# ── Entropy-gated monoT5 → duoT5 cascade ─────────────────────────────────────
+# Gate signal: normalized rank-distribution entropy over top-20 monoT5 scores.
+#   H_norm = -Σ p_i log(p_i) / log(K),  p_i = s_i / Σ s_j
+# High entropy (→ 1) means monoT5 spreads probability mass flatly across top-20
+# docs — genuinely uncertain ordering that duoT5 can improve.
+# τ=0.950 selected as Pareto knee from monoDuotgate/grid_search.py entropy sweep:
+# saves 43.8% of duoT5 calls at nDCG@10=0.8786 vs always-duo 0.8876.
+
+ENTROPY_GATED_K   = 20
+ENTROPY_GATED_TAU = 0.950
+
+
+class MonoEntropyGatedDuoCascade:
+    """BM25 → monoT5 (rank all) → duoT5 on top-20 only when H@20 ≥ 0.950.
+
+    Normalized rank-distribution entropy over the top-20 monoT5 P(true) scores
+    is used as the per-query uncertainty signal.  A high value means the model
+    distributes relevance probability flatly — duoT5 pairwise comparison then
+    resolves the ambiguity.  When entropy is low monoT5 is confident and its
+    ordering is kept as-is.
+    """
+
+    name = "mono_entropy_gated_duo"
+
+    def __init__(self, k: int = ENTROPY_GATED_K, tau: float = ENTROPY_GATED_TAU):
+        self.k   = k
+        self.tau = tau
+        self.mono = registry.get("monot5")
+        self.duo  = registry.get("duot5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        cand_map    = dict(candidates)
+        mono_ranked = self.mono.rerank(query, candidates)  # [(docid, P(true))], desc
+
+        top_k  = mono_ranked[:self.k]
+        tail   = mono_ranked[self.k:]
+        scores = [s for _, s in top_k]
+
+        h_norm = 0.0
+        s_sum  = sum(scores)
+        if s_sum > 0 and len(scores) > 1:
+            probs  = [s / s_sum for s in scores]
+            h      = -sum(p * math.log(p + 1e-15) for p in probs if p > 0)
+            h_norm = h / math.log(len(probs))
+
+        _log.debug(
+            "H_norm=%.4f  tau=%.4f  trigger=%s  query=%r",
+            h_norm, self.tau, h_norm >= self.tau, query[:60],
+        )
+
+        if h_norm >= self.tau:
+            head_pairs = [(d, cand_map[d]) for d, _ in top_k if d in cand_map]
+            duo_ranked = self.duo.rerank(query, head_pairs)
+            merged     = list(duo_ranked) + list(tail)
+        else:
+            merged = mono_ranked
+
+        n = len(merged)
+        return [(docid, float(n - i)) for i, (docid, _) in enumerate(merged)]
+
+
+# ── Entropy-gated monoT5 → LiT5 cascade ──────────────────────────────────────
+# Gate signal: normalized rank-distribution entropy over all 50 monoT5 scores.
+#   H_norm = -Σ p_i log(p_i) / log(50),  p_i = s_i / Σ s_j
+# τ=0.839 selected as best/knee from monoLiT5gate/grid_search.py:
+# nDCG@10=0.8656 (beats always-LiT5 0.8632) saving 144 queries (42.4% cost).
+
+ENTROPY_H50_LIT5_K   = 50
+ENTROPY_H50_LIT5_TAU = 0.839
+
+
+class MonoEntropyH50GatedLiT5Cascade:
+    """BM25 → monoT5 (rank all) → LiT5 on all candidates only when H@50 ≥ 0.839.
+
+    Normalized rank-distribution entropy over all 50 BM25 candidates' monoT5
+    P(true) scores is the per-query gate.  High entropy → monoT5 spreads mass
+    flatly across the candidate set → LiT5 listwise sliding-window reranks all
+    50 docs.  Low entropy → monoT5 is confident → its ordering is kept as-is,
+    saving the full LiT5 forward pass.
+
+    τ=0.839 is the Pareto-optimal knee from monoLiT5gate/grid_search.py:
+    nDCG@10=0.8656, saves 42.4% of LiT5 calls vs always running LiT5.
+    """
+
+    name = "mono_entropy_h50_lit5"
+
+    def __init__(self, k: int = ENTROPY_H50_LIT5_K, tau: float = ENTROPY_H50_LIT5_TAU):
+        self.k   = k
+        self.tau = tau
+        self.mono = registry.get("monot5")
+        self.lit5 = registry.get("lit5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        mono_ranked = self.mono.rerank(query, candidates)  # [(docid, P(true))], desc
+
+        # H@50: entropy over all available monoT5 scores (up to self.k)
+        top_k  = mono_ranked[:self.k]
+        scores = [s for _, s in top_k]
+
+        h_norm = 0.0
+        s_sum  = sum(scores)
+        if s_sum > 0 and len(scores) > 1:
+            probs  = [s / s_sum for s in scores]
+            h      = -sum(p * math.log(p + 1e-15) for p in probs if p > 0)
+            h_norm = h / math.log(len(probs))
+
+        _log.debug(
+            "H50_norm=%.4f  tau=%.4f  trigger=%s  query=%r",
+            h_norm, self.tau, h_norm >= self.tau, query[:60],
+        )
+
+        if h_norm >= self.tau:
+            lit5_ranked = self.lit5.rerank(query, candidates)
+            merged      = list(lit5_ranked)
+        else:
+            merged = mono_ranked
+
+        n = len(merged)
+        return [(docid, float(n - i)) for i, (docid, _) in enumerate(merged)]
+
+
+# ── Entropy H@50 gated monoT5 → duoT5 cascade ────────────────────────────────
+# Gate signal: normalized rank-distribution entropy over all 50 monoT5 scores.
+#   H_norm = -Σ p_i log(p_i) / log(50),  p_i = s_i / Σ s_j
+# τ=0.832 selected as Pareto knee from monoDuotgate/grid_search.py:
+# nDCG@10=0.8854, saves 140 queries (41.2% cost reduction) vs always-duo.
+
+ENTROPY_H50_DUO_K     = 50
+ENTROPY_H50_DUO_TAU   = 0.832
+ENTROPY_H50_DUO_TOP_N = 20   # duoT5 tournament on top-N when triggered
+
+
+class MonoEntropyH50GatedDuoCascade:
+    """BM25 → monoT5 (rank all) → duoT5 on top-20 only when H@50 ≥ 0.832.
+
+    Normalized rank-distribution entropy over all 50 BM25 candidates' monoT5
+    P(true) scores is the per-query gate.  High entropy → monoT5 spreads mass
+    flatly across the full candidate set → duoT5 pairwise tournament resolves
+    the top-20.  Low entropy → monoT5 is confident → its ordering is kept,
+    saving the full duoT5 forward pass.
+
+    τ=0.832 is the Pareto knee from monoDuotgate/grid_search.py:
+    nDCG@10=0.8854 (@1=0.9412, @5=0.9065), saves 41.2% of duoT5 calls.
+    """
+
+    name = "mono_entropy_h50_duo"
+
+    def __init__(self, k: int = ENTROPY_H50_DUO_K, tau: float = ENTROPY_H50_DUO_TAU):
+        self.k     = k
+        self.tau   = tau
+        self.top_n = ENTROPY_H50_DUO_TOP_N
+        self.mono  = registry.get("monot5")
+        self.duo   = registry.get("duot5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        cand_map    = dict(candidates)
+        mono_ranked = self.mono.rerank(query, candidates)
+
+        scores = [s for _, s in mono_ranked[:self.k]]
+        h_norm = 0.0
+        s_sum  = sum(scores)
+        if s_sum > 0 and len(scores) > 1:
+            probs  = [s / s_sum for s in scores]
+            h      = -sum(p * math.log(p + 1e-15) for p in probs if p > 0)
+            h_norm = h / math.log(len(probs))
+
+        _log.debug(
+            "H50_norm=%.4f  tau=%.4f  trigger=%s  query=%r",
+            h_norm, self.tau, h_norm >= self.tau, query[:60],
+        )
+
+        if h_norm >= self.tau:
+            head       = mono_ranked[:self.top_n]
+            tail       = mono_ranked[self.top_n:]
+            head_pairs = [(d, cand_map[d]) for d, _ in head if d in cand_map]
+            duo_ranked = self.duo.rerank(query, head_pairs)
+            merged     = list(duo_ranked) + list(tail)
+        else:
+            merged = mono_ranked
+
+        n = len(merged)
+        return [(docid, float(n - i)) for i, (docid, _) in enumerate(merged)]

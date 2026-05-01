@@ -40,6 +40,10 @@ _EVAL_MODELS = (
     "bge_v2_m3",
     "qwen3_reranker_4b",
     "rank_zephyr",
+    "mono_entropy_gated_duo",
+    "lit5_finetuned",
+    "mono_entropy_h50_lit5",
+    "mono_entropy_h50_duo",
 )
 
 
@@ -121,6 +125,18 @@ def get(name: str) -> Reranker:
         elif name == "rank_zephyr":
             from .rank_zephyr import RankZephyrReranker
             inst = RankZephyrReranker()
+        elif name == "mono_entropy_gated_duo":
+            from .cascade import MonoEntropyGatedDuoCascade
+            inst = MonoEntropyGatedDuoCascade()
+        elif name == "lit5_finetuned":
+            from .lit5 import LiT5Reranker
+            inst = LiT5Reranker(checkpoint=config.CHECKPOINTS["lit5_finetuned"])
+        elif name == "mono_entropy_h50_lit5":
+            from .cascade import MonoEntropyH50GatedLiT5Cascade
+            inst = MonoEntropyH50GatedLiT5Cascade()
+        elif name == "mono_entropy_h50_duo":
+            from .cascade import MonoEntropyH50GatedDuoCascade
+            inst = MonoEntropyH50GatedDuoCascade()
         else:
             raise ValueError(f"Unknown reranker: {name}")
 

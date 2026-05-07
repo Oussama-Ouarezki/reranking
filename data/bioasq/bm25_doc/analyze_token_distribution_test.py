@@ -47,11 +47,16 @@ def plot_histogram(lengths: list[int], out_path: Path):
     fig, ax = plt.subplots(figsize=(10, 6))
     sns.histplot(lengths, bins=60, color='steelblue', alpha=0.85, ax=ax)
 
-    mean_len = np.mean(lengths)
+    arr = np.array(lengths)
+    mean_len   = arr.mean()
+    std_len    = arr.std()
+    var_len    = arr.var()
     ax.axvline(mean_len, color='#e74c3c', linewidth=2,
                linestyle='--', label=f'Mean = {mean_len:.0f}')
-    ax.axvline(np.median(lengths), color='#f39c12', linewidth=2,
-               linestyle=':', label=f'Median = {np.median(lengths):.0f}')
+    ax.axvline(np.median(arr), color='#f39c12', linewidth=2,
+               linestyle=':', label=f'Median = {np.median(arr):.0f}')
+    ax.axvspan(mean_len - std_len, mean_len + std_len, alpha=0.10,
+               color='#e74c3c', label=f'±1 SD  (σ={std_len:.0f}, σ²={var_len:.0f})')
 
     ax.set_title('Token Length Distribution — BioASQ Test Corpus (13B1–13B4)', fontsize=14, pad=12)
     ax.set_xlabel('Token count per document', fontsize=12)
@@ -130,15 +135,20 @@ def main():
     print(f'  {len(lengths):,} documents loaded')
 
     arr = np.array(lengths)
+    q25, q50, q75 = np.percentile(arr, [25, 50, 75])
+    iqr = q75 - q25
     print(f'\n{"─"*40}')
-    print(f'  Min     : {arr.min():,}')
-    print(f'  Max     : {arr.max():,}')
-    print(f'  Mean    : {arr.mean():.1f}')
-    print(f'  Median  : {np.median(arr):.1f}')
-    print(f'  P75     : {np.percentile(arr, 75):.1f}')
-    print(f'  P90     : {np.percentile(arr, 90):.1f}')
-    print(f'  P95     : {np.percentile(arr, 95):.1f}')
-    print(f'  Std dev : {arr.std():.1f}')
+    print(f'  Min      : {arr.min():,}')
+    print(f'  Max      : {arr.max():,}')
+    print(f'  Mean     : {arr.mean():.1f}')
+    print(f'  Std dev  : {arr.std():.1f}')
+    print(f'  Variance : {arr.var():.1f}')
+    print(f'  Q1 (P25) : {q25:.1f}')
+    print(f'  Median   : {q50:.1f}')
+    print(f'  Q3 (P75) : {q75:.1f}')
+    print(f'  IQR      : {iqr:.1f}')
+    print(f'  P90      : {np.percentile(arr, 90):.1f}')
+    print(f'  P95      : {np.percentile(arr, 95):.1f}')
     print(f'{"─"*40}')
 
     print('\nGenerating plots...')

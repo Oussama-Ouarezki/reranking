@@ -21,6 +21,7 @@ _EVAL_MODELS = (
     "monot5_bioasq",
     "duot5",
     "duot5_bioasq",
+    "duot5_rolling",
     "lit5",
     "mono_duo",
     "monot5_lit5",
@@ -44,6 +45,12 @@ _EVAL_MODELS = (
     "lit5_finetuned",
     "mono_entropy_h50_lit5",
     "mono_entropy_h50_duo",
+    "qwen4b_linear_fusion",
+    "qwen4b_linear_fusion_dynamic",
+    "qwen4b_linear_fusion_dynamic_10",
+    "qwen4b_linear_fusion_dynamic_gated",
+    "biobert",
+    "bm25_biobert",
 )
 
 
@@ -68,6 +75,9 @@ def get(name: str) -> Reranker:
         elif name == "duot5_bioasq":
             from .duot5 import DuoT5Reranker
             inst = DuoT5Reranker(checkpoint=config.CHECKPOINTS["duot5_bioasq"], batch_size=16)
+        elif name == "duot5_rolling":
+            from .duot5 import DuoT5RollingReranker
+            inst = DuoT5RollingReranker(batch_size=16)
         elif name == "lit5":
             from .lit5 import LiT5Reranker
             inst = LiT5Reranker()
@@ -137,6 +147,24 @@ def get(name: str) -> Reranker:
         elif name == "mono_entropy_h50_duo":
             from .cascade import MonoEntropyH50GatedDuoCascade
             inst = MonoEntropyH50GatedDuoCascade()
+        elif name == "qwen4b_linear_fusion":
+            from .cascade import QwenLinearFusionCascade
+            inst = QwenLinearFusionCascade()
+        elif name == "qwen4b_linear_fusion_dynamic":
+            from .cascade import QwenLinearFusionDynamicCascade
+            inst = QwenLinearFusionDynamicCascade()
+        elif name == "qwen4b_linear_fusion_dynamic_10":
+            from .cascade import QwenLinearFusionDynamic10Cascade
+            inst = QwenLinearFusionDynamic10Cascade()
+        elif name == "qwen4b_linear_fusion_dynamic_gated":
+            from .cascade import QwenLinearFusionDynamicGatedCascade
+            inst = QwenLinearFusionDynamicGatedCascade()
+        elif name == "biobert":
+            from .biobert import BioBERTReranker
+            inst = BioBERTReranker(batch_size=16)
+        elif name == "bm25_biobert":
+            from .cascade import BM25BioBERTCascade
+            inst = BM25BioBERTCascade()
         else:
             raise ValueError(f"Unknown reranker: {name}")
 

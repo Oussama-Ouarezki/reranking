@@ -23,8 +23,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 BASE    = Path('/home/oussama/Desktop/reranking_project')
-DOC_DIR = BASE / 'data' / 'bioasq' / 'raw' / 'Task13BGoldenEnriched'
-OUT_DIR = BASE / 'data' / 'bioasq' / 'bm25_doc'
+DOC_DIR = BASE / 'data' / 'bioasq' / 'processed'
+OUT_DIR = BASE / 'data' / 'bioasq' / 'bm25_doc' / 'images'
 
 
 def load_qrels(path):
@@ -50,6 +50,12 @@ def plot_histogram(counts: list[int], out_path: Path):
     sns.set_theme(style='whitegrid')
     plt.style.use('ggplot')
 
+    arr       = np.array(counts)
+    mean_val  = np.mean(arr)
+    median_val = np.median(arr)
+    q1        = np.percentile(arr, 25)
+    q3        = np.percentile(arr, 75)
+
     max_count = max(counts)
     bins = list(range(0, max_count + 2))
 
@@ -57,18 +63,22 @@ def plot_histogram(counts: list[int], out_path: Path):
     sns.histplot(counts, bins=bins, discrete=True,
                  color='steelblue', alpha=0.85, ax=ax)
 
-    mean_val = np.mean(counts)
-    ax.axvline(mean_val, color='#e74c3c', linewidth=2,
-               linestyle='--', label=f'Mean = {mean_val:.1f}')
-    ax.axvline(np.median(counts), color='#f39c12', linewidth=2,
-               linestyle=':', label=f'Median = {np.median(counts):.0f}')
+    ax.axvline(mean_val,   color='#e74c3c', linewidth=2,   linestyle='--',
+               label=f'Mean = {mean_val:.1f}')
+    ax.axvline(median_val, color='#f39c12', linewidth=2,   linestyle=':',
+               label=f'Median = {median_val:.0f}')
+    ax.axvline(q1,         color='#8e44ad', linewidth=1.8, linestyle='-.',
+               label=f'Q1 = {q1:.0f}')
+    ax.axvline(q3,         color='#16a085', linewidth=1.8, linestyle='-.',
+               label=f'Q3 = {q3:.0f}')
 
     ax.set_title('Distribution of Relevant Documents per Query — BioASQ',
                  fontsize=14, pad=12)
     ax.set_xlabel('Number of relevant documents', fontsize=12)
     ax.set_ylabel('Number of queries', fontsize=12)
-    ax.set_xticks(range(0, max_count + 1, max(1, max_count // 20)))
-    ax.legend(fontsize=11)
+    ax.set_xlim(0, 50)
+    ax.set_xticks(range(0, 51, 5))
+    ax.legend(fontsize=10)
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)

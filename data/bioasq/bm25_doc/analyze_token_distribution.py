@@ -76,7 +76,6 @@ def _add_variance_text(ax, lengths, x=0.98, y=0.97):
                   edgecolor='#bdc3c7', alpha=0.85),
     )
 
-
 def plot_histogram(lengths: list[int], out_path: Path):
     plt.style.use('ggplot')
     sns.set_theme(style='whitegrid')
@@ -95,13 +94,13 @@ def plot_histogram(lengths: list[int], out_path: Path):
     ax.set_title('Token Length Distribution — BioASQ Document Corpus', fontsize=14, pad=12)
     ax.set_xlabel('Token count per document', fontsize=12)
     ax.set_ylabel('Number of documents', fontsize=12)
+    ax.set_xlim(0, 1300)  # ← ADD THIS LINE
     ax.legend(fontsize=10)
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
     plt.close()
     print(f'  Saved → {out_path}')
-
 
 def plot_cumulative(lengths: list[int], out_path: Path):
     plt.style.use('ggplot')

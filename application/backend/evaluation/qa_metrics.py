@@ -54,6 +54,23 @@ def exact_match(pred: str, gold_groups: list[list[str]]) -> float:
 FACTOID_MAX_CANDIDATES = 5
 
 
+def factoid_strict_accuracy(pred: str, gold_groups: list[list[str]]) -> float:
+    """1.0 iff the *first* parsed candidate matches any gold synonym."""
+    if not pred or not gold_groups:
+        return 0.0
+    candidates = _parse_list_items(pred)[:1]
+    if not candidates:
+        return 0.0
+    first = normalize(candidates[0])
+    if not first:
+        return 0.0
+    for group in gold_groups:
+        for g in group:
+            if normalize(g) == first:
+                return 1.0
+    return 0.0
+
+
 def factoid_mrr(pred: str, gold_groups: list[list[str]]) -> float:
     """BioASQ official factoid metric.
 
@@ -128,6 +145,29 @@ def _matches_any_group(item: str, gold_groups: list[list[str]]) -> int:
             if normalize(g) == n:
                 return i
     return -1
+
+
+def list_map(pred: str, gold_groups: list[list[str]]) -> float:
+    """Average precision over the predicted list, treating it as a ranking.
+
+    For each predicted item in order, if it matches a gold group not yet
+    counted, record precision-at-this-rank. AP = sum / |gold_groups|.
+    """
+    if not gold_groups:
+        return 0.0
+    items = _parse_list_items(pred)
+    if not items:
+        return 0.0
+    matched_groups: set[int] = set()
+    sum_prec = 0.0
+    hits = 0
+    for rank, it in enumerate(items, start=1):
+        gi = _matches_any_group(it, gold_groups)
+        if gi >= 0 and gi not in matched_groups:
+            matched_groups.add(gi)
+            hits += 1
+            sum_prec += hits / rank
+    return sum_prec / len(gold_groups)
 
 
 def list_f1(pred: str, gold_groups: list[list[str]]) -> float:
@@ -373,6 +413,7 @@ def score_answer_full(
         groups = _coerce_groups(query.get("exact_answer"))
         if groups:
             result["qa_score"] = factoid_mrr(pred, groups)
+            result["strict_acc"] = factoid_strict_accuracy(pred, groups)
 
     elif qtype == "yesno":
         gold = query.get("exact_answer")
@@ -387,6 +428,7 @@ def score_answer_full(
         groups = _coerce_groups(query.get("exact_answer"))
         if groups:
             result["qa_score"] = list_f1(pred, groups)
+            result["map"] = list_map(pred, groups)
 
     elif qtype == "summary":
         ideals = _coerce_ideals(query.get("ideal_answer"))

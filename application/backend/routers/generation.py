@@ -99,6 +99,7 @@ def _list_gen_runs(retrieval_run_id: str | None = None) -> list[dict]:
                 "by_qtype": (d.get("aggregate") or {}).get("by_qtype"),
                 "n_per_qtype": (d.get("aggregate") or {}).get("n_per_qtype"),
                 "comment": d.get("comment", ""),
+                "starred": bool(d.get("starred", False)),
             })
     out.sort(key=lambda r: r.get("ended_at") or 0, reverse=True)
     return out
@@ -167,6 +168,28 @@ def _gen_run_summary_cell(d: dict) -> dict:
 
     extra_by_qtype = (agg.get("extra_by_qtype") or {})
     summary_extras = extra_by_qtype.get("summary") or {}
+    factoid_extras = dict(extra_by_qtype.get("factoid") or {})
+    list_extras = dict(extra_by_qtype.get("list") or {})
+
+    # Backfill strict_acc / list_map for older cached runs that pre-date them.
+    if "strict_acc" not in factoid_extras:
+        vals = [
+            float(e["extra_metrics"]["strict_acc"])
+            for e in per_query.values()
+            if e.get("qtype") == "factoid"
+            and (e.get("extra_metrics") or {}).get("strict_acc") is not None
+        ]
+        if vals:
+            factoid_extras["strict_acc"] = round(sum(vals) / len(vals), 4)
+    if "map" not in list_extras:
+        vals = [
+            float(e["extra_metrics"]["map"])
+            for e in per_query.values()
+            if e.get("qtype") == "list"
+            and (e.get("extra_metrics") or {}).get("map") is not None
+        ]
+        if vals:
+            list_extras["map"] = round(sum(vals) / len(vals), 4)
     skip_judge = bool((d.get("config") or {}).get("skip_judge", False))
 
     return {
@@ -177,6 +200,8 @@ def _gen_run_summary_cell(d: dict) -> dict:
         "retrieval": retrieval,
         "summary_rouge_l": summary_extras.get("rouge_l"),
         "summary_bert_score": summary_extras.get("bert_score"),
+        "factoid_strict_acc": factoid_extras.get("strict_acc"),
+        "list_map": list_extras.get("map"),
         "skip_judge": skip_judge,
         "elapsed_s": d.get("elapsed_s"),
         "comment": d.get("comment", ""),
@@ -242,10 +267,10 @@ def gen_summary():
 
 @router.patch("/generation/runs/{run_id}")
 def update_gen_run(run_id: str, body: dict = Body(...)):
-    """Update mutable fields on a generation run. Currently only ``comment``."""
-    if "comment" not in body:
-        raise HTTPException(status_code=400, detail="only 'comment' is patchable")
-    comment = str(body["comment"])
+    """Update mutable fields on a generation run: ``comment`` and/or ``starred``."""
+    allowed = {"comment", "starred"}
+    if not any(k in body for k in allowed):
+        raise HTTPException(status_code=400, detail="only 'comment' and 'starred' are patchable")
     if not GEN_RUNS_DIR.exists():
         raise HTTPException(status_code=404, detail="generation run not found")
     for retrieval_dir in GEN_RUNS_DIR.iterdir():
@@ -258,10 +283,13 @@ def update_gen_run(run_id: str, body: dict = Body(...)):
             except Exception:
                 continue
             if d.get("run_id") == run_id or f.stem == run_id:
-                d["comment"] = comment
+                if "comment" in body:
+                    d["comment"] = str(body["comment"])
+                if "starred" in body:
+                    d["starred"] = bool(body["starred"])
                 with open(f, "w") as fh:
                     json.dump(d, fh)
-                return {"ok": True, "comment": comment}
+                return {"ok": True}
     raise HTTPException(status_code=404, detail="generation run not found")
 
 
@@ -371,6 +399,10 @@ def _aggregate(per_query: dict[str, dict]) -> dict:
     yesno_pairs: list[tuple[str | None, str]] = []
     summary_extra_sums: dict[str, float] = {}
     summary_extra_counts: dict[str, int] = {}
+    factoid_strict_sum = 0.0
+    factoid_strict_count = 0
+    list_map_sum = 0.0
+    list_map_count = 0
 
     for entry in per_query.values():
         if entry.get("qa_score") is None:
@@ -390,6 +422,16 @@ def _aggregate(per_query: dict[str, dict]) -> dict:
                 if v is not None:
                     summary_extra_sums[m] = summary_extra_sums.get(m, 0.0) + float(v)
                     summary_extra_counts[m] = summary_extra_counts.get(m, 0) + 1
+        elif t == "factoid":
+            sa = extra.get("strict_acc")
+            if sa is not None:
+                factoid_strict_sum += float(sa)
+                factoid_strict_count += 1
+        elif t == "list":
+            mp = extra.get("map")
+            if mp is not None:
+                list_map_sum += float(mp)
+                list_map_count += 1
 
     by_qtype = {t: round(sums[t] / counts[t], 4) for t in sums if counts[t] > 0}
     n_per_qtype = dict(counts)
@@ -401,6 +443,14 @@ def _aggregate(per_query: dict[str, dict]) -> dict:
         extra_by_qtype["summary"] = {
             k: round(summary_extra_sums[k] / summary_extra_counts[k], 4)
             for k in summary_extra_counts
+        }
+    if factoid_strict_count > 0:
+        extra_by_qtype["factoid"] = {
+            "strict_acc": round(factoid_strict_sum / factoid_strict_count, 4)
+        }
+    if list_map_count > 0:
+        extra_by_qtype["list"] = {
+            "map": round(list_map_sum / list_map_count, 4)
         }
 
     return {"by_qtype": by_qtype, "n_per_qtype": n_per_qtype, "extra_by_qtype": extra_by_qtype}

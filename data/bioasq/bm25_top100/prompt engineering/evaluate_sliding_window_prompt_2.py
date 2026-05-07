@@ -34,7 +34,7 @@ plt.style.use("ggplot")
 BASE        = Path(__file__).resolve().parents[4]
 QRELS       = BASE / "data/bioasq/processed/qrels.tsv"
 BM25_FILE   = BASE / "data/bioasq/bm25_top100/bm25_top100_ids.jsonl"
-DS_SW_FILE   = BASE / "data/bioasq/bm25_top100/prompt engineering/deepseek_sliding_reranked_512_rankgpt.jsonl"
+DS_SW_FILE   = BASE / "data/bioasq/bm25_top100/prompt engineering/deepseek_sliding_reranked_prompt_2_reasoning.jsonl"
 IMG_DIR     = BASE / "data/bioasq/bm25_top100/prompt engineering/images"
 
 TOP_N     = 50

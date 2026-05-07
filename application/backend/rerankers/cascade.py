@@ -848,3 +848,268 @@ class MonoEntropyH50GatedDuoCascade:
 
         n = len(merged)
         return [(docid, float(n - i)) for i, (docid, _) in enumerate(merged)]
+
+
+# ── Qwen3-4B + BM25 pure linear fusion (no gate) ─────────────────────────────
+# For every query, blend Qwen P(yes) and BM25 score linearly:
+#   score(d) = alpha * qwen_minmax(d) + (1-alpha) * bm25_minmax(d)
+# Both score channels are min-max normalised per query before blending.
+# Hyperparameters were chosen by sweeping alpha on a 500-query slice from
+# BioASQ training — see qwen4b_uncertainty/10_best_cascade_params.py.
+
+
+def _minmax_per_query(values: list[float]) -> list[float]:
+    if not values:
+        return []
+    lo, hi = min(values), max(values)
+    if hi - lo < 1e-12:
+        return [0.0] * len(values)
+    span = hi - lo
+    return [(v - lo) / span for v in values]
+
+
+def _qwen_bm25_linear(
+    qwen_ranked: list[tuple[str, float]],
+    bm25_scores: dict[str, float] | None,
+    alpha: float,
+) -> list[tuple[str, float]]:
+    """Return docs reordered by linear blend of Qwen and BM25 (min-max norm)."""
+    if not qwen_ranked:
+        return []
+    if not bm25_scores:
+        # No BM25 prior available — fall back to Qwen ordering, but rewrite
+        # scores as descending integers so downstream metric code works the
+        # same as for cascades that synthesise scores at the end.
+        n = len(qwen_ranked)
+        return [(d, float(n - i)) for i, (d, _) in enumerate(qwen_ranked)]
+
+    docids   = [d for d, _ in qwen_ranked]
+    qwen_vec = [s for _, s in qwen_ranked]
+    bm25_vec = [float(bm25_scores.get(d, 0.0)) for d in docids]
+
+    qn = _minmax_per_query(qwen_vec)
+    bn = _minmax_per_query(bm25_vec)
+    fused = [alpha * q + (1 - alpha) * b for q, b in zip(qn, bn)]
+
+    order = sorted(range(len(docids)), key=lambda i: fused[i], reverse=True)
+    merged = [(docids[i], fused[i]) for i in order]
+    n = len(merged)
+    return [(d, float(n - i)) for i, (d, _) in enumerate(merged)]
+
+
+# Config A — single global α, target = global nDCG@10
+# Selected by sweep on 500 BioASQ training queries (qwen4b_uncertainty/
+# 10_best_cascade_params.py).  α* = 0.825 → nDCG@10 = 0.8418 (+0.0094 vs Qwen).
+QWEN_LF_ALPHA = 0.825
+
+
+class QwenLinearFusionCascade:
+    """BM25 → Qwen3-4B (50 docs) → linear blend with BM25 (every query).
+
+    Pure linear fusion, no gating:
+        score(d) = α · qwen_minmax(d) + (1-α) · bm25_minmax(d)
+    Both channels are min-max normalised per query before blending.
+
+    α=0.825 was selected to maximise GLOBAL nDCG@10 on a 500-query BioASQ
+    training slice — see qwen4b_uncertainty/10_best_cascade_params.py.
+    """
+
+    name = "qwen4b_linear_fusion"
+
+    def __init__(self, alpha: float = QWEN_LF_ALPHA):
+        self.alpha = alpha
+        self.qwen  = registry.get("qwen3_reranker_4b")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
+        qtype: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+        qwen_ranked = self.qwen.rerank(query, candidates)
+        _log.debug("qwen4b_linear_fusion: alpha=%.3f query=%r",
+                   self.alpha, query[:60])
+        return _qwen_bm25_linear(qwen_ranked, bm25_scores, self.alpha)
+
+
+# Config B — per-type α, each optimised for the metric most relevant to that
+# question type:
+#   list    → nDCG@3    α* = 0.875
+#   summary → nDCG@10   α* = 0.800
+#   yesno   → nDCG@1    α* = 0.750
+#   factoid → nDCG@5    α* = 0.875
+QWEN_LF_DYNAMIC_ALPHA: dict[str, float] = {
+    "list":    0.875,
+    "summary": 0.800,
+    "yesno":   0.750,
+    "factoid": 0.875,
+}
+# Fallback when query type is missing or unknown — same α as Config A.
+QWEN_LF_DYNAMIC_FALLBACK = QWEN_LF_ALPHA
+
+
+class QwenLinearFusionDynamicCascade:
+    """BM25 → Qwen3-4B → linear fusion with per-query-type α (no gate).
+
+    Each BioASQ question type gets its own α optimised for the metric most
+    relevant to that question type (see qwen4b_uncertainty/10_best_cascade_params.py):
+        list    → nDCG@3    α* = 0.875
+        summary → nDCG@10   α* = 0.800
+        yesno   → nDCG@1    α* = 0.750
+        factoid → nDCG@5    α* = 0.875
+
+    The eval router passes the query's `qtype` as a kwarg; if the type is
+    missing the cascade falls back to the global α=0.825 (Config A).
+    """
+
+    name = "qwen4b_linear_fusion_dynamic"
+
+    def __init__(self) -> None:
+        self.alpha_by_type = QWEN_LF_DYNAMIC_ALPHA
+        self.fallback      = QWEN_LF_DYNAMIC_FALLBACK
+        self.qwen          = registry.get("qwen3_reranker_4b")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
+        qtype: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        alpha = self.alpha_by_type.get(qtype or "", self.fallback)
+
+        qwen_ranked = self.qwen.rerank(query, candidates)
+        _log.debug("qwen4b_linear_fusion_dynamic: qtype=%s alpha=%.3f query=%r",
+                   qtype, alpha, query[:60])
+        return _qwen_bm25_linear(qwen_ranked, bm25_scores, alpha)
+
+
+# Config B′ — per-type α, every type optimised for nDCG@10 (uniform target).
+# Differs from QwenLinearFusionDynamicCascade only on factoid (0.875 → 0.925).
+QWEN_LF_DYNAMIC10_ALPHA: dict[str, float] = {
+    "list":    0.975,
+    "summary": 1,
+    "yesno":   0.750,
+    "factoid": 0.975,
+}
+
+
+class QwenLinearFusionDynamic10Cascade(QwenLinearFusionDynamicCascade):
+    """BM25 → Qwen3-4B → linear fusion with per-query-type α (all → nDCG@10).
+
+    Same as qwen4b_linear_fusion_dynamic but every type's α is the value that
+    maximises nDCG@10 specifically — simpler to reason about when nDCG@10 is
+    the deployment target. The only α that differs from the mixed-target
+    variant is factoid (0.925 instead of 0.875).
+
+        list    α* = 0.875
+        summary α* = 0.800
+        yesno   α* = 0.750
+        factoid α* = 0.925
+
+    Fallback α (unknown qtype) = 0.825 (Config A global).
+    """
+
+    name = "qwen4b_linear_fusion_dynamic_10"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.alpha_by_type = QWEN_LF_DYNAMIC10_ALPHA
+
+
+# ── Qwen3-4B + BM25 linear fusion gated by per-type H@20 entropy threshold ───
+# Per-query-type (alpha, tau) hyperparameters. tau is a threshold on the
+# normalized rank-distribution entropy of Qwen P(yes) over the top-20 docs:
+#   H@20_norm = -Σ p_i log(p_i) / log(20),  p_i = s_i / Σ s_j  (s_j over top-20)
+# Gate: if H@20 > tau → fuse with linear (alpha); else keep pure Qwen ranking.
+#
+# Hyperparameters from qwen4b_uncertainty/14_gated_dynamic_search.py.
+# K=20 chosen over K=50 in Stage 1 (tied global nDCG@10, more selective gate).
+# Per-type tau optimised at each type's natural metric:
+#   list    target nDCG@3   alpha=0.875  tau=0.8242   (~86% fused)
+#   summary target nDCG@10  alpha=0.800  tau=0.4246   (~96% fused)
+#   yesno   target nDCG@1   alpha=0.750  tau=0.6494   (~98% fused)
+#   factoid target nDCG@5   alpha=0.875  tau=0.0000   (always fuse)
+
+
+def _h20_norm_entropy(qwen_ranked: list[tuple[str, float]]) -> float:
+    """Normalized rank-distribution entropy over the top-20 Qwen P(yes) scores."""
+    scores = [s for _, s in qwen_ranked[:20]]
+    s_sum = sum(scores)
+    if s_sum <= 0 or len(scores) < 2:
+        return 0.0
+    probs = [s / s_sum for s in scores]
+    h = -sum(p * math.log(p + 1e-15) for p in probs if p > 0)
+    return h / math.log(len(probs))
+
+
+QWEN_LF_DYNAMIC_GATED_PARAMS: dict[str, tuple[float, float]] = {
+    "list":    (0.925, 0.0000),
+    "summary": (0.975, 0.4246),
+    "yesno":   (0.975, 0.0000),
+    "factoid": (0.675, 0.0000),
+}
+# Fallback (alpha, tau) when qtype is missing/unknown — global α=0.825 with the
+# Stage-1 global tau τ*=0.4246 from H@20.
+QWEN_LF_DYNAMIC_GATED_FALLBACK = (QWEN_LF_ALPHA, 0.4246)
+
+
+class QwenLinearFusionDynamicGatedCascade:
+    """BM25 → Qwen3-4B → per-type (α, τ) linear fusion gated on H@20 entropy.
+
+    For each query, look up (alpha, tau) by qtype. Compute H@20 over the top-20
+    Qwen P(yes) values. Fuse linearly with BM25 when H@20 > tau; otherwise keep
+    pure Qwen.
+
+    Per-type parameters (selected from
+    qwen4b_uncertainty/14_gated_dynamic_search.py — H@20 won Stage 1):
+        list    α=0.875  τ=0.8242   target nDCG@3   (~86% fused)
+        summary α=0.800  τ=0.4246   target nDCG@10  (~96% fused)
+        yesno   α=0.750  τ=0.6494   target nDCG@1   (~98% fused)
+        factoid α=0.875  τ=0.0000   target nDCG@5   (always fuse)
+
+    Fallback (unknown qtype): α=0.825, τ=0.4246 (Stage-1 global optimum).
+    """
+
+    name = "qwen4b_linear_fusion_dynamic_gated"
+
+    def __init__(self) -> None:
+        self.params   = QWEN_LF_DYNAMIC_GATED_PARAMS
+        self.fallback = QWEN_LF_DYNAMIC_GATED_FALLBACK
+        self.qwen     = registry.get("qwen3_reranker_4b")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
+        qtype: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        alpha, tau = self.params.get(qtype or "", self.fallback)
+
+        qwen_ranked = self.qwen.rerank(query, candidates)
+        h20 = _h20_norm_entropy(qwen_ranked)
+        triggered = h20 > tau
+
+        _log.debug(
+            "qwen4b_linear_fusion_dynamic_gated: qtype=%s alpha=%.3f tau=%.4f "
+            "H@20=%.4f trigger=%s query=%r",
+            qtype, alpha, tau, h20, triggered, query[:60],
+        )
+
+        if not triggered:
+            n = len(qwen_ranked)
+            return [(d, float(n - i)) for i, (d, _) in enumerate(qwen_ranked)]
+        return _qwen_bm25_linear(qwen_ranked, bm25_scores, alpha)

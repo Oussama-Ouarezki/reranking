@@ -8,6 +8,7 @@ import torch
 from transformers import T5ForConditionalGeneration, AutoTokenizer
 
 from .. import config
+from ._bm25_inject import inject as _bm25_inject
 
 TOKEN_TRUE = "▁true"
 TOKEN_FALSE = "▁false"
@@ -60,9 +61,13 @@ class MonoT5Reranker:
         self,
         query: str,
         candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
     ) -> list[tuple[str, float]]:
         if not candidates:
             return []
+        # Inject BM25 prior into each candidate's text. Comment out to disable.
+        candidates = _bm25_inject(candidates, bm25_scores, bm25_inject_mode)
         docids = [c[0] for c in candidates]
         texts = [c[1] for c in candidates]
         scores: list[float] = []

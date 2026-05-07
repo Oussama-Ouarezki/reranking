@@ -297,6 +297,7 @@ def _run_one_query(
     bm25,
     corpus,
     qrels: dict,
+    bm25_inject_mode: str | None = None,
 ):
     """Returns metrics, full_ranked, top_docids, qtype."""
     qid = query["_id"]
@@ -308,11 +309,30 @@ def _run_one_query(
     if model_name != "bm25" and hits:
         reranker = rerank_registry.get(model_name)
         candidates = []
+        bm25_scores: dict[str, float] = {}
         for h in hits:
             text = corpus.get_text(h["docid"])
             if text:
                 candidates.append((h["docid"], text))
-        ranked = reranker.rerank(qtext, candidates)
+                bm25_scores[h["docid"]] = float(h["score"])
+        # Pass per-doc BM25 scores and qtype; rerankers ignore kwargs they
+        # don't accept (we fall back through narrower signatures on TypeError).
+        try:
+            ranked = reranker.rerank(
+                qtext, candidates,
+                bm25_scores=bm25_scores,
+                bm25_inject_mode=bm25_inject_mode,
+                qtype=qtype,
+            )
+        except TypeError:
+            try:
+                ranked = reranker.rerank(
+                    qtext, candidates,
+                    bm25_scores=bm25_scores,
+                    bm25_inject_mode=bm25_inject_mode,
+                )
+            except TypeError:
+                ranked = reranker.rerank(qtext, candidates)
         score_map = dict(ranked)
         order = [docid for docid, _ in ranked]
         hits = [
@@ -341,6 +361,7 @@ async def eval_run(ws: WebSocket):
     models: list[str] = cfg_msg.get("models", ["bm25"])
     n_questions: int | None = cfg_msg.get("n_questions")
     comment: str = str(cfg_msg.get("comment", "") or "")
+    bm25_inject_mode: str | None = cfg_msg.get("bm25_inject_mode") or None
 
     bm25 = deps.get_bm25()
     corpus = deps.get_corpus()
@@ -370,7 +391,7 @@ async def eval_run(ws: WebSocket):
                 try:
                     metrics, full_ranked, top_docids, qtype = await asyncio.to_thread(
                         _run_one_query,
-                        model_name, q, bm25, corpus, qrels,
+                        model_name, q, bm25, corpus, qrels, bm25_inject_mode,
                     )
                 except Exception as exc:
                     await ws.send_json({
@@ -415,6 +436,7 @@ async def eval_run(ws: WebSocket):
                     "n_questions": total_queries,
                     "sampled_qids": sampled_qids if n_questions else None,
                     "seed": SAMPLE_SEED if n_questions else None,
+                    "bm25_inject_mode": bm25_inject_mode,
                 },
                 "comment": comment,
                 "aggregate": agg,

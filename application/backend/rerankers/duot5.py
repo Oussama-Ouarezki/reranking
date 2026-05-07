@@ -13,6 +13,7 @@ import torch
 from transformers import T5ForConditionalGeneration, AutoTokenizer
 
 from .. import config
+from ._bm25_inject import inject as _bm25_inject
 
 TOKEN_TRUE = "▁true"
 TOKEN_FALSE = "▁false"
@@ -68,9 +69,14 @@ class DuoT5Reranker:
         self,
         query: str,
         candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
     ) -> list[tuple[str, float]]:
         if not candidates:
             return []
+
+        # Inject BM25 prior into each candidate's text. Comment out to disable.
+        candidates = _bm25_inject(candidates, bm25_scores, bm25_inject_mode)
 
         # Keep a tail of low-relevance candidates pinned at the end so we can
         # safely return a full ranking even when truncating to TOURNAMENT_TOP_N.

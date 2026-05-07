@@ -22,7 +22,7 @@ BM25_B = 0.9
 CHECKPOINTS = {
     "monot5": ROOT / "checkpoints/monot5-base-msmarco-100k",
     "duot5": ROOT / "checkpoints/duot5-base-msmarco",
-    "lit5": ROOT / "checkpoints/LiT5-Distill-base",
+    "lit5": ROOT / "checkpoints/fine_tuned_lit5",
     "monot5_bioasq": ROOT / "checkpoints/monot5-bioasq-finetuned",
     "duot5_bioasq": ROOT / "checkpoints/duot5-bioasq-finetuned",
     "lit5_finetuned": ROOT / "checkpoints/fine_tuned_lit5",

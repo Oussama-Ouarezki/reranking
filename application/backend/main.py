@@ -2,9 +2,12 @@
 
 from contextlib import asynccontextmanager
 import logging
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 from . import deps
 from .routers import queries as queries_router
@@ -36,7 +39,7 @@ app = FastAPI(title="BioRAG", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -51,3 +54,11 @@ app.include_router(generation_router.router, prefix="/api")
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+
+_dist = Path(__file__).parent.parent / "frontend" / "dist"
+app.mount("/assets", StaticFiles(directory=_dist / "assets"), name="assets")
+
+@app.get("/{full_path:path}")
+def serve_spa(full_path: str):
+    return FileResponse(_dist / "index.html")

@@ -6,6 +6,7 @@ Two visualizations for BioASQ processed data:
 
 import json
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -58,13 +59,18 @@ fig.savefig(out1, dpi=150)
 print(f"Saved {out1}")
 
 # ── 2. Load queries → year counts ────────────────────────────────────────────
+def _year_from_id(oid: str) -> str:
+    ts = int(oid[:8], 16)
+    return str(datetime.fromtimestamp(ts, tz=timezone.utc).year)
+
 year_counts: Counter = Counter()
 with QUERIES.open() as f:
     for line in f:
         rec = json.loads(line)
-        if "created_at" in rec:
-            year = rec["created_at"][:4]
-            year_counts[year] += 1
+        try:
+            year_counts[_year_from_id(rec["_id"])] += 1
+        except (KeyError, ValueError):
+            pass
 
 years  = sorted(year_counts)
 totals = [year_counts[y] for y in years]
@@ -94,8 +100,10 @@ qid_to_year = {}
 with QUERIES.open() as f:
     for line in f:
         rec = json.loads(line)
-        if "created_at" in rec:
-            qid_to_year[rec["_id"]] = rec["created_at"][:4]
+        try:
+            qid_to_year[rec["_id"]] = _year_from_id(rec["_id"])
+        except (KeyError, ValueError):
+            pass
 
 year_5plus: Counter = Counter()
 for qid, count in doc_counts.items():
@@ -137,6 +145,7 @@ labels_cum     = ["all", "2+", "3+", "4+", "5+"]
 palette        = sns.color_palette("tab10", len(thresholds_cum))
 
 fig4, ax4 = plt.subplots(figsize=(10, 5.5))
+cum_3plus = []
 for thresh, label, color in zip(thresholds_cum, labels_cum, palette):
     cumulative, running = [], 0
     for y in years_desc:
@@ -144,8 +153,32 @@ for thresh, label, color in zip(thresholds_cum, labels_cum, palette):
             if cnt > thresh and qid in qid_to_year and qid_to_year[qid] == y:
                 running += 1
         cumulative.append(running)
+    if thresh == 3:
+        cum_3plus = list(cumulative)
     ax4.plot(years_desc, cumulative, marker="o", linewidth=2.2,
              markersize=6, color=color, label=label)
+
+# find the year where 3+ cumulative first reaches 2000
+target = 2000
+cross_year = None
+for i, val in enumerate(cum_3plus):
+    if val >= target:
+        cross_year = years_desc[i]
+        break
+
+if cross_year is not None:
+    ax4.axhline(y=target, color="gray", linewidth=1.4, linestyle="--", alpha=0.8,
+                label=f"{target:,} queries")
+    ax4.axvline(x=cross_year, color="gray", linewidth=1.4, linestyle="--", alpha=0.8)
+    ax4.annotate(
+        f"3+ reaches {target:,}\nat {cross_year}",
+        xy=(cross_year, target),
+        xytext=(10, -40),
+        textcoords="offset points",
+        fontsize=9,
+        color="gray",
+        arrowprops=dict(arrowstyle="->", color="gray", lw=1.2),
+    )
 
 ax4.set_title("Cumulative queries by doc threshold (newest → oldest)", fontsize=13, pad=12)
 ax4.set_xlabel("Year", fontsize=11)

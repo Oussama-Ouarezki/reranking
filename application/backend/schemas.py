@@ -4,7 +4,7 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
 
-ModelName = Literal["bm25", "monot5", "duot5", "lit5", "mono_duo", "monot5_lit5", "mono_uncertain_duo_lit5", "mono_dynamic_duo_lit5", "mono_gated_duo", "mono_proximity_duo", "mono_proximity_duo_lit5", "lit5_duo", "mono_proximity_duo_0005", "mono_proximity_duo_005_top30", "mono_mau_duo_low_cost", "mono_mau_duo_pareto", "mono_gated_lit5_top20", "mono_gated_lit5_top40", "mono_gated_lit5_top50", "bge_v2_m3", "qwen3_reranker_4b", "rank_zephyr"]
+ModelName = Literal["bm25", "monot5", "duot5", "lit5", "mono_duo", "monot5_lit5", "mono_uncertain_duo_lit5", "mono_dynamic_duo_lit5", "mono_gated_duo", "mono_proximity_duo", "mono_proximity_duo_lit5", "lit5_duo", "mono_proximity_duo_0005", "mono_proximity_duo_005_top30", "mono_mau_duo_low_cost", "mono_mau_duo_pareto", "mono_gated_lit5_top20", "mono_gated_lit5_top40", "mono_gated_lit5_top50", "bge_v2_m3", "qwen3_reranker_4b", "rank_zephyr", "mono_entropy_gated_duo", "lit5_finetuned", "mono_entropy_h50_lit5", "mono_entropy_h50_duo", "qwen4b_linear_fusion", "qwen4b_linear_fusion_dynamic", "qwen4b_linear_fusion_dynamic_10", "qwen4b_linear_fusion_dynamic_gated"]
 QuestionType = Literal["factoid", "list", "yesno", "summary"]
 
 

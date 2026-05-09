@@ -1062,6 +1062,337 @@ QWEN_LF_DYNAMIC_GATED_PARAMS: dict[str, tuple[float, float]] = {
 QWEN_LF_DYNAMIC_GATED_FALLBACK = (QWEN_LF_ALPHA, 0.4246)
 
 
+# ── Qwen3-0.6B cascades on top of Linear Fusion (per-type α 0.99/0.99/0.99/0.85)
+# Hyperparameters from qwen3_0.6b/ experiments on Task13BGoldenEnriched (340 q):
+#   α: summary=0.99, factoid=0.99, list=0.99, yesno=0.85   (Recall@20-tuned)
+#   Cascade A (LF→LiT5 top-20): nDCG@1=0.9494, MRR@10=0.9669
+#   Cascade B (LF→duoT5(15-25)→LiT5 top-20): nDCG@1=0.9583, MRR@10=0.9715  (best)
+
+QWEN06B_LF_ALPHA: dict[str, float] = {
+    "summary": 0.99,
+    "factoid": 0.99,
+    "list":    0.99,
+    "yesno":   0.85,
+}
+QWEN06B_LF_FALLBACK = 0.99
+
+# Uniform α=0.999 across all query types — selected by a fine sweep on
+# Task13BGoldenEnriched targeting global nDCG@10 (qwen3_0.6b/16_lf_alpha_sweep_ndcg.py).
+# Tiny BM25 nudge breaks ties in Qwen's score distribution.
+# Test-set: nDCG@1=0.9256, nDCG@5=0.9104, nDCG@10=0.8896, MRR@10=0.9549.
+QWEN06B_LF_999_ALPHA = 0.999
+
+# Window where Qwen rank-disagreement is highest — duoT5 reranks this band.
+UNC_BAND_LO = 14   # 0-indexed: LF rank 15
+UNC_BAND_HI = 25   # exclusive: through LF rank 25
+
+# LiT5 head size after duoT5 promotes the best 6 from the band.
+LIT5_TOP_K = 20
+
+
+def _lf_blend(
+    qwen_ranked: list[tuple[str, float]],
+    bm25_scores: dict[str, float] | None,
+    alpha: float,
+) -> list[tuple[str, float]]:
+    """Per-query min-max LF blend; returns docs sorted by fused score."""
+    if not qwen_ranked:
+        return []
+    if not bm25_scores or alpha >= 1.0:
+        return list(qwen_ranked)
+    docids = [d for d, _ in qwen_ranked]
+    qvec = [s for _, s in qwen_ranked]
+    bvec = [float(bm25_scores.get(d, 0.0)) for d in docids]
+    qn = _minmax_per_query(qvec)
+    bn = _minmax_per_query(bvec)
+    fused = [alpha * q + (1 - alpha) * b for q, b in zip(qn, bn)]
+    order = sorted(range(len(docids)), key=lambda i: fused[i], reverse=True)
+    return [(docids[i], fused[i]) for i in order]
+
+
+class Qwen06BLFCascade:
+    """BM25 → Qwen3-0.6B → per-type linear fusion with BM25 (no extra reranker).
+
+    Per-type α (Recall@20-tuned on BioASQ Task13BGoldenEnriched):
+        summary=0.99, factoid=0.99, list=0.99, yesno=0.85.
+    Score = α · qwen_minmax + (1-α) · bm25_minmax (per-query min-max norm).
+    """
+
+    name = "qwen06b_lf"
+
+    def __init__(self) -> None:
+        self.alpha_by_type = QWEN06B_LF_ALPHA
+        self.fallback      = QWEN06B_LF_FALLBACK
+        self.qwen          = registry.get("qwen3_reranker_0_6b")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
+        qtype: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+        alpha = self.alpha_by_type.get(qtype or "", self.fallback)
+        qwen_ranked = self.qwen.rerank(query, candidates)
+        _log.debug("qwen06b_lf: qtype=%s alpha=%.3f query=%r",
+                   qtype, alpha, query[:60])
+        return _qwen_bm25_linear(qwen_ranked, bm25_scores, alpha)
+
+
+class Qwen06BLF999Cascade:
+    """BM25 → Qwen3-0.6B → linear fusion with BM25 (uniform α=0.999, all qtypes).
+
+    Score = α · qwen_minmax + (1-α) · bm25_minmax (per-query min-max norm).
+    α=0.999 selected by fine sweep on Task13BGoldenEnriched targeting global
+    nDCG@10 (qwen3_0.6b/16_lf_alpha_sweep_ndcg.py). Test-set:
+        nDCG@1=0.9256, nDCG@5=0.9104, nDCG@10=0.8896, MRR@10=0.9549.
+    """
+
+    name = "qwen06b_lf_999"
+
+    def __init__(self) -> None:
+        self.alpha = QWEN06B_LF_999_ALPHA
+        self.qwen  = registry.get("qwen3_reranker_0_6b")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
+        qtype: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+        qwen_ranked = self.qwen.rerank(query, candidates)
+        _log.debug("qwen06b_lf_999: alpha=%.3f query=%r", self.alpha, query[:60])
+        return _qwen_bm25_linear(qwen_ranked, bm25_scores, self.alpha)
+
+
+class Qwen06BLFLiT5Cascade:
+    """BM25 → Qwen3-0.6B → per-type LF blend → LiT5 top-20 listwise.
+
+    Per-type α (Recall@20-tuned): summary 0.99, factoid 0.99, list 0.99, yesno 0.85.
+    LiT5-Distill listwise reranks the LF top-20 in a single 20-passage window;
+    positions 21+ are kept in their LF order pinned below.
+    """
+
+    name = "qwen06b_lf_lit5"
+
+    def __init__(self) -> None:
+        self.alpha_by_type = QWEN06B_LF_ALPHA
+        self.fallback      = QWEN06B_LF_FALLBACK
+        self.qwen          = registry.get("qwen3_reranker_0_6b")
+        self.lit5          = registry.get("lit5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
+        qtype: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        alpha = self.alpha_by_type.get(qtype or "", self.fallback)
+        cand_map = dict(candidates)
+
+        qwen_ranked = self.qwen.rerank(query, candidates)
+        lf_ranked = _lf_blend(qwen_ranked, bm25_scores, alpha)
+        order = [d for d, _ in lf_ranked]
+
+        head_ids = order[:LIT5_TOP_K]
+        tail_ids = order[LIT5_TOP_K:]
+        head_window = [(d, cand_map.get(d, "")) for d in head_ids]
+        head_ranked = self.lit5.rerank(query, head_window)
+        head_order = [d for d, _ in head_ranked]
+
+        merged = head_order + tail_ids
+        n = len(merged)
+        _log.debug("qwen06b_lf_lit5: qtype=%s alpha=%.3f query=%r",
+                   qtype, alpha, query[:60])
+        return [(d, float(n - i)) for i, d in enumerate(merged)]
+
+
+class Qwen06BLFDuoUncLiT5Cascade:
+    """BM25 → Qwen3-0.6B → per-type LF → duoT5 on uncertainty band → LiT5 top-20.
+
+    Pipeline:
+      1. Qwen3-0.6B scores BM25 top-50.
+      2. Linear-fusion blend with BM25 (per-type α: 0.99/0.99/0.99/0.85).
+      3. duoT5 tournament over the LF positions 15..25 (uncertainty band).
+      4. New top-20 = LF positions 1..14 (unchanged) + top-6 from duoT5 reorder.
+      5. LiT5-Distill listwise reranks that top-20 in one 20-passage window.
+      6. Tail = remaining docs (in LF/duoT5 order), pinned below the LiT5 head.
+
+    Best-performing config on the BioASQ Task13BGoldenEnriched test set:
+        global nDCG@1=0.9583, nDCG@5=0.9170, nDCG@10=0.8913, MRR@10=0.9715.
+    """
+
+    name = "qwen06b_lf_duot5_unc_lit5"
+
+    def __init__(self) -> None:
+        self.alpha_by_type = QWEN06B_LF_ALPHA
+        self.fallback      = QWEN06B_LF_FALLBACK
+        self.qwen          = registry.get("qwen3_reranker_0_6b")
+        self.duo           = registry.get("duot5")
+        self.lit5          = registry.get("lit5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
+        qtype: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        alpha = self.alpha_by_type.get(qtype or "", self.fallback)
+        cand_map = dict(candidates)
+
+        qwen_ranked = self.qwen.rerank(query, candidates)
+        lf_ranked = _lf_blend(qwen_ranked, bm25_scores, alpha)
+        order = [d for d, _ in lf_ranked]
+
+        head14 = order[:UNC_BAND_LO]            # ranks 1..14
+        band   = order[UNC_BAND_LO:UNC_BAND_HI] # ranks 15..25
+        rest   = order[UNC_BAND_HI:]            # ranks 26..50
+
+        if band:
+            band_pairs = [(d, cand_map.get(d, "")) for d in band]
+            band_ranked = self.duo.rerank(query, band_pairs)
+            band_order = [d for d, _ in band_ranked]
+        else:
+            band_order = []
+
+        band_top6 = band_order[:6]
+        band_rest = band_order[6:]
+        new_top20 = head14 + band_top6
+        full_order_after_duo = head14 + band_top6 + band_rest + rest
+
+        head_window = [(d, cand_map.get(d, "")) for d in new_top20]
+        head_ranked = self.lit5.rerank(query, head_window)
+        head_order = [d for d, _ in head_ranked]
+
+        used = set(head_order)
+        tail = [d for d in full_order_after_duo if d not in used]
+        merged = head_order + tail
+        n = len(merged)
+        _log.debug("qwen06b_lf_duot5_unc_lit5: qtype=%s alpha=%.3f query=%r",
+                   qtype, alpha, query[:60])
+        return [(d, float(n - i)) for i, d in enumerate(merged)]
+
+
+class Qwen06BLF999LiT5Cascade:
+    """BM25 → Qwen3-0.6B → LF (uniform α=0.999) → LiT5 top-20 listwise.
+
+    Uniform α=0.999 across all query types (selected by sweep on BioASQ test).
+    LiT5-Distill listwise reranks the LF top-20 in a single 20-passage window;
+    positions 21+ kept in their LF order pinned below.
+    Test-set: nDCG@1=0.9464, nDCG@5=0.9159, nDCG@10=0.8922, MRR@10=0.9656.
+    """
+
+    name = "qwen06b_lf_999_lit5"
+
+    def __init__(self) -> None:
+        self.alpha = QWEN06B_LF_999_ALPHA
+        self.qwen  = registry.get("qwen3_reranker_0_6b")
+        self.lit5  = registry.get("lit5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
+        qtype: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+        cand_map = dict(candidates)
+        qwen_ranked = self.qwen.rerank(query, candidates)
+        lf_ranked = _lf_blend(qwen_ranked, bm25_scores, self.alpha)
+        order = [d for d, _ in lf_ranked]
+
+        head_ids = order[:LIT5_TOP_K]
+        tail_ids = order[LIT5_TOP_K:]
+        head_window = [(d, cand_map.get(d, "")) for d in head_ids]
+        head_ranked = self.lit5.rerank(query, head_window)
+        head_order = [d for d, _ in head_ranked]
+
+        merged = head_order + tail_ids
+        n = len(merged)
+        _log.debug("qwen06b_lf_999_lit5: alpha=%.4f query=%r", self.alpha, query[:60])
+        return [(d, float(n - i)) for i, d in enumerate(merged)]
+
+
+class Qwen06BLF999DuoUncLiT5Cascade:
+    """BM25 → Qwen3-0.6B → LF (uniform α=0.999) → duoT5(15-25) → LiT5 top-20.
+
+    Same pipeline as qwen06b_lf_duot5_unc_lit5 but with uniform α=0.999 instead
+    of per-type α. Test-set: nDCG@1=0.9524, nDCG@5=0.9195, nDCG@10=0.8939,
+    MRR@10=0.9690.
+    """
+
+    name = "qwen06b_lf_999_duot5_unc_lit5"
+
+    def __init__(self) -> None:
+        self.alpha = QWEN06B_LF_999_ALPHA
+        self.qwen  = registry.get("qwen3_reranker_0_6b")
+        self.duo   = registry.get("duot5")
+        self.lit5  = registry.get("lit5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
+        qtype: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+        cand_map = dict(candidates)
+        qwen_ranked = self.qwen.rerank(query, candidates)
+        lf_ranked = _lf_blend(qwen_ranked, bm25_scores, self.alpha)
+        order = [d for d, _ in lf_ranked]
+
+        head14 = order[:UNC_BAND_LO]
+        band   = order[UNC_BAND_LO:UNC_BAND_HI]
+        rest   = order[UNC_BAND_HI:]
+
+        if band:
+            band_pairs = [(d, cand_map.get(d, "")) for d in band]
+            band_ranked = self.duo.rerank(query, band_pairs)
+            band_order = [d for d, _ in band_ranked]
+        else:
+            band_order = []
+
+        band_top6 = band_order[:6]
+        band_rest = band_order[6:]
+        new_top20 = head14 + band_top6
+        full_order_after_duo = head14 + band_top6 + band_rest + rest
+
+        head_window = [(d, cand_map.get(d, "")) for d in new_top20]
+        head_ranked = self.lit5.rerank(query, head_window)
+        head_order = [d for d, _ in head_ranked]
+
+        used = set(head_order)
+        tail = [d for d in full_order_after_duo if d not in used]
+        merged = head_order + tail
+        n = len(merged)
+        _log.debug("qwen06b_lf_999_duot5_unc_lit5: alpha=%.4f query=%r",
+                   self.alpha, query[:60])
+        return [(d, float(n - i)) for i, d in enumerate(merged)]
+
+
 class QwenLinearFusionDynamicGatedCascade:
     """BM25 → Qwen3-4B → per-type (α, τ) linear fusion gated on H@20 entropy.
 

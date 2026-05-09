@@ -5,6 +5,7 @@ Models included:
   monoT5  - castorini/monot5-base-msmarco-10k   (best for fine-tuning)
   monoT5  - castorini/monot5-base-msmarco        (100k steps, best for MS MARCO eval)
   duoT5   - castorini/duot5-base-msmarco         (pairwise, used after monoT5)
+  duoT5   - castorini/duot5-3b-med-msmarco       (3B pairwise, medical + MS MARCO)
   LiT5    - castorini/LiT5-Distill-base          (listwise distillation)
 
 Usage:
@@ -13,7 +14,7 @@ Usage:
     python download_checkpoints.py --model monot5_10k monot5_100k lit5_distill
 
 Available --model keys:
-    monot5_10k, monot5_100k, duot5, lit5_distill
+    monot5_10k, monot5_100k, duot5, duot5_3b_med, duot5_base_med, lit5_distill
 """
 
 import os
@@ -21,26 +22,37 @@ import argparse
 from huggingface_hub import snapshot_download
 
 CHECKPOINTS = {
-    "monot5_10k": {
-        "hf_id":     "castorini/monot5-base-msmarco-10k",
-        "local_dir": "checkpoints/monot5-base-msmarco-10k",
-        "note":      "Best starting point for fine-tuning on medical data",
+    # "monot5_10k": {
+    #     "hf_id":     "castorini/monot5-base-msmarco-10k",
+    #     "local_dir": "checkpoints/monot5-base-msmarco-10k",
+    #     "note":      "Best starting point for fine-tuning on medical data",
+    # },
+    # "monot5_100k": {
+    #     "hf_id":     "castorini/monot5-base-msmarco",
+    #     "local_dir": "checkpoints/monot5-base-msmarco-100k",
+    #     "note":      "Strongest on MS MARCO — use for thesis MRR@10 evaluation",
+    # },
+    # "duot5": {
+    #     "hf_id":     "castorini/duot5-base-msmarco",
+    #     "local_dir": "checkpoints/duot5-base-msmarco",
+    #     "note":      "Pairwise reranker — typically cascaded after monoT5",
+    # },
+    # "lit5_distill": {
+    #     "hf_id":     "castorini/LiT5-Distill-base",
+    #     "local_dir": "checkpoints/LiT5-Distill-base",
+    #     "note":      "Listwise reranker via distillation (nDCG@10: 71.7 on TREC DL)",
+    # },
+     "duot5_base_med": {
+        "hf_id":     "castorini/duot5-base-med-msmarco",
+        "local_dir": "checkpoints/duot5-base-med-msmarco",
+        "note":      "Base pairwise reranker fine-tuned on medical + MS MARCO data",
     },
-    "monot5_100k": {
-        "hf_id":     "castorini/monot5-base-msmarco",
-        "local_dir": "checkpoints/monot5-base-msmarco-100k",
-        "note":      "Strongest on MS MARCO — use for thesis MRR@10 evaluation",
+    "duot5_3b_med": {
+        "hf_id":     "castorini/duot5-3b-med-msmarco",
+        "local_dir": "checkpoints/duot5-3b-med-msmarco",
+        "note":      "3B pairwise reranker fine-tuned on medical + MS MARCO data",
     },
-    "duot5": {
-        "hf_id":     "castorini/duot5-base-msmarco",
-        "local_dir": "checkpoints/duot5-base-msmarco",
-        "note":      "Pairwise reranker — typically cascaded after monoT5",
-    },
-    "lit5_distill": {
-        "hf_id":     "castorini/LiT5-Distill-base",
-        "local_dir": "checkpoints/LiT5-Distill-base",
-        "note":      "Listwise reranker via distillation (nDCG@10: 71.7 on TREC DL)",
-    },
+   
 }
 
 

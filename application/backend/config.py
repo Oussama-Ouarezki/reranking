@@ -22,10 +22,18 @@ BM25_B = 0.9
 CHECKPOINTS = {
     "monot5": ROOT / "checkpoints/monot5-base-msmarco-100k",
     "duot5": ROOT / "checkpoints/duot5-base-msmarco",
-    "lit5": ROOT / "checkpoints/fine_tuned_lit5",
+    "lit5": ROOT / "checkpoints/LiT5-Distill-base",
     "monot5_bioasq": ROOT / "checkpoints/monot5-bioasq-finetuned",
     "duot5_bioasq": ROOT / "checkpoints/duot5-bioasq-finetuned",
     "lit5_finetuned": ROOT / "checkpoints/fine_tuned_lit5",
+    "lit5_bioasq_lora": ROOT / "checkpoints/lit5_bioasq_lora_local/epoch_2",
+    "lit5_bioasq_lora_e1": ROOT / "checkpoints/lit5_bioasq_lora_local/epoch_1",
+    "lit5_bioasq_lora_e3": ROOT / "checkpoints/lit5_bioasq_lora_local/epoch_3",
+    "lit5_bioasq_lora_kaggle": ROOT / "checkpoints/lit5_bioasq_lora_kaggle/epoch_3",
+    "lit5_bioasq_lora_kaggle_e1": ROOT / "checkpoints/lit5_bioasq_lora_kaggle/epoch_1",
+    "lit5_bioasq_lora_kaggle_e2": ROOT / "checkpoints/lit5_bioasq_lora_kaggle/epoch_2",
+    "lit5_bioasq_lora_kaggle_e3": ROOT / "checkpoints/lit5_bioasq_lora_kaggle/epoch_3",
+    "lit5_bioasq_lora_kaggle_e4": ROOT / "checkpoints/lit5_bioasq_lora_kaggle/epoch_4",
 }
 
 # Java for Pyserini (must be set before importing pyserini)

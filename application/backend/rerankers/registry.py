@@ -18,32 +18,41 @@ _LOCK = RLock()
 _EVAL_MODELS = (
     "bm25",
     "monot5",
-    "monot5_bioasq",
+    # "monot5_bioasq",
     "duot5",
-    "duot5_bioasq",
+    # "duot5_bioasq",
     "duot5_rolling",
     "lit5",
     "mono_duo",
-    "monot5_lit5",
-    "mono_uncertain_duo_lit5",
-    "mono_dynamic_duo_lit5",
-    "mono_gated_duo",
-    "mono_proximity_duo",
-    "mono_proximity_duo_lit5",
-    "lit5_duo",
-    "mono_proximity_duo_0005",
-    "mono_proximity_duo_005_top30",
-    "mono_mau_duo_low_cost",
-    "mono_mau_duo_pareto",
-    "mono_gated_lit5_top20",
-    "mono_gated_lit5_top40",
-    "mono_gated_lit5_top50",
-    "bge_v2_m3",
+    # "monot5_lit5",
+    # "mono_uncertain_duo_lit5",
+    # "mono_dynamic_duo_lit5",
+    # "mono_gated_duo",
+    # "mono_proximity_duo",
+    # "mono_proximity_duo_lit5",
+    # "lit5_duo",
+    # "mono_proximity_duo_0005",
+    # "mono_proximity_duo_005_top30",
+    # "mono_mau_duo_low_cost",
+    # "mono_mau_duo_pareto",
+    # "mono_gated_lit5_top20",
+    # "mono_gated_lit5_top40",
+    # "mono_gated_lit5_top50",
+    # "bge_v2_m3",
     "qwen3_reranker_4b",
-    "rank_zephyr",
-    "mono_entropy_gated_duo",
+    "qwen3_reranker_0_6b",
+    # "rank_zephyr",
+    # "mono_entropy_gated_duo",
     "lit5_finetuned",
-    "mono_entropy_h50_lit5",
+    "lit5_bioasq_lora",
+    "lit5_bioasq_lora_e1",
+    "lit5_bioasq_lora_e3",
+    "lit5_bioasq_lora_kaggle",
+    "lit5_bioasq_lora_kaggle_e1",
+    "lit5_bioasq_lora_kaggle_e2",
+    "lit5_bioasq_lora_kaggle_e3",
+    "lit5_bioasq_lora_kaggle_e4",
+    # "mono_entropy_h50_lit5",
     "mono_entropy_h50_duo",
     "qwen4b_linear_fusion",
     "qwen4b_linear_fusion_dynamic",
@@ -51,6 +60,12 @@ _EVAL_MODELS = (
     "qwen4b_linear_fusion_dynamic_gated",
     "biobert",
     "bm25_biobert",
+    "qwen06b_lf",
+    "qwen06b_lf_999",
+    "qwen06b_lf_999_lit5",
+    "qwen06b_lf_999_duot5_unc_lit5",
+    "qwen06b_lf_lit5",
+    "qwen06b_lf_duot5_unc_lit5",
 )
 
 
@@ -66,15 +81,15 @@ def get(name: str) -> Reranker:
         if name == "monot5":
             from .monot5 import MonoT5Reranker
             inst = MonoT5Reranker(batch_size=32)
-        elif name == "monot5_bioasq":
-            from .monot5 import MonoT5Reranker
-            inst = MonoT5Reranker(checkpoint=config.CHECKPOINTS["monot5_bioasq"], batch_size=32)
+        # elif name == "monot5_bioasq":
+        #     from .monot5 import MonoT5Reranker
+        #     inst = MonoT5Reranker(checkpoint=config.CHECKPOINTS["monot5_bioasq"], batch_size=32)
         elif name == "duot5":
             from .duot5 import DuoT5Reranker
             inst = DuoT5Reranker(batch_size=16)
-        elif name == "duot5_bioasq":
-            from .duot5 import DuoT5Reranker
-            inst = DuoT5Reranker(checkpoint=config.CHECKPOINTS["duot5_bioasq"], batch_size=16)
+        # elif name == "duot5_bioasq":
+        #     from .duot5 import DuoT5Reranker
+        #     inst = DuoT5Reranker(checkpoint=config.CHECKPOINTS["duot5_bioasq"], batch_size=16)
         elif name == "duot5_rolling":
             from .duot5 import DuoT5RollingReranker
             inst = DuoT5RollingReranker(batch_size=16)
@@ -84,66 +99,93 @@ def get(name: str) -> Reranker:
         elif name == "mono_duo":
             from .cascade import MonoDuoCascade
             inst = MonoDuoCascade()
-        elif name == "monot5_lit5":
-            from .cascade import MonoThreshLiT5Cascade
-            inst = MonoThreshLiT5Cascade()
-        elif name == "mono_uncertain_duo_lit5":
-            from .cascade import MonoUncertainDuoLiT5Cascade
-            inst = MonoUncertainDuoLiT5Cascade()
-        elif name == "mono_dynamic_duo_lit5":
-            from .cascade import MonoDynamicDuoLiT5Cascade
-            inst = MonoDynamicDuoLiT5Cascade()
-        elif name == "mono_gated_duo":
-            from .cascade import MonoGatedDuoCascade
-            inst = MonoGatedDuoCascade()
-        elif name == "mono_proximity_duo":
-            from .cascade import MonoProximityDuoCascade
-            inst = MonoProximityDuoCascade()
-        elif name == "mono_proximity_duo_lit5":
-            from .cascade import MonoProximityDuoLiT5Cascade
-            inst = MonoProximityDuoLiT5Cascade()
-        elif name == "lit5_duo":
-            from .cascade import LiT5DuoCascade
-            inst = LiT5DuoCascade()
-        elif name == "mono_proximity_duo_0005":
-            from .cascade import MonoProximityDuoCascade0005
-            inst = MonoProximityDuoCascade0005()
-        elif name == "mono_proximity_duo_005_top30":
-            from .cascade import MonoProximityDuoCascade005Top30
-            inst = MonoProximityDuoCascade005Top30()
-        elif name == "mono_mau_duo_low_cost":
-            from .cascade import MonoMauDuoLowCost
-            inst = MonoMauDuoLowCost()
-        elif name == "mono_mau_duo_pareto":
-            from .cascade import MonoMauDuoPareto
-            inst = MonoMauDuoPareto()
-        elif name == "mono_gated_lit5_top20":
-            from .cascade import MonoGatedLiT5Top20
-            inst = MonoGatedLiT5Top20()
-        elif name == "mono_gated_lit5_top40":
-            from .cascade import MonoGatedLiT5Top40
-            inst = MonoGatedLiT5Top40()
-        elif name == "mono_gated_lit5_top50":
-            from .cascade import MonoGatedLiT5Top50
-            inst = MonoGatedLiT5Top50()
-        elif name == "bge_v2_m3":
-            from .bge import BGERerankerV2M3
-            inst = BGERerankerV2M3(batch_size=32)
+        # elif name == "monot5_lit5":
+        #     from .cascade import MonoThreshLiT5Cascade
+        #     inst = MonoThreshLiT5Cascade()
+        # elif name == "mono_uncertain_duo_lit5":
+        #     from .cascade import MonoUncertainDuoLiT5Cascade
+        #     inst = MonoUncertainDuoLiT5Cascade()
+        # elif name == "mono_dynamic_duo_lit5":
+        #     from .cascade import MonoDynamicDuoLiT5Cascade
+        #     inst = MonoDynamicDuoLiT5Cascade()
+        # elif name == "mono_gated_duo":
+        #     from .cascade import MonoGatedDuoCascade
+        #     inst = MonoGatedDuoCascade()
+        # elif name == "mono_proximity_duo":
+        #     from .cascade import MonoProximityDuoCascade
+        #     inst = MonoProximityDuoCascade()
+        # elif name == "mono_proximity_duo_lit5":
+        #     from .cascade import MonoProximityDuoLiT5Cascade
+        #     inst = MonoProximityDuoLiT5Cascade()
+        # elif name == "lit5_duo":
+        #     from .cascade import LiT5DuoCascade
+        #     inst = LiT5DuoCascade()
+        # elif name == "mono_proximity_duo_0005":
+        #     from .cascade import MonoProximityDuoCascade0005
+        #     inst = MonoProximityDuoCascade0005()
+        # elif name == "mono_proximity_duo_005_top30":
+        #     from .cascade import MonoProximityDuoCascade005Top30
+        #     inst = MonoProximityDuoCascade005Top30()
+        # elif name == "mono_mau_duo_low_cost":
+        #     from .cascade import MonoMauDuoLowCost
+        #     inst = MonoMauDuoLowCost()
+        # elif name == "mono_mau_duo_pareto":
+        #     from .cascade import MonoMauDuoPareto
+        #     inst = MonoMauDuoPareto()
+        # elif name == "mono_gated_lit5_top20":
+        #     from .cascade import MonoGatedLiT5Top20
+        #     inst = MonoGatedLiT5Top20()
+        # elif name == "mono_gated_lit5_top40":
+        #     from .cascade import MonoGatedLiT5Top40
+        #     inst = MonoGatedLiT5Top40()
+        # elif name == "mono_gated_lit5_top50":
+        #     from .cascade import MonoGatedLiT5Top50
+        #     inst = MonoGatedLiT5Top50()
+        # elif name == "bge_v2_m3":
+        #     from .bge import BGERerankerV2M3
+        #     inst = BGERerankerV2M3(batch_size=32)
         elif name == "qwen3_reranker_4b":
             from .qwen3 import Qwen3Reranker4B
             inst = Qwen3Reranker4B()
-        elif name == "rank_zephyr":
-            from .rank_zephyr import RankZephyrReranker
-            inst = RankZephyrReranker()
-        elif name == "mono_entropy_gated_duo":
-            from .cascade import MonoEntropyGatedDuoCascade
-            inst = MonoEntropyGatedDuoCascade()
+        elif name == "qwen3_reranker_0_6b":
+            from .qwen3 import Qwen3Reranker06B
+            inst = Qwen3Reranker06B()
+        # elif name == "rank_zephyr":
+        #     from .rank_zephyr import RankZephyrReranker
+        #     inst = RankZephyrReranker()
+        # elif name == "mono_entropy_gated_duo":
+        #     from .cascade import MonoEntropyGatedDuoCascade
+        #     inst = MonoEntropyGatedDuoCascade()
         elif name == "lit5_finetuned":
             from .lit5 import LiT5Reranker
             inst = LiT5Reranker(checkpoint=config.CHECKPOINTS["lit5_finetuned"])
-        elif name == "mono_entropy_h50_lit5":
-            from .cascade import MonoEntropyH50GatedLiT5Cascade
-            inst = MonoEntropyH50GatedLiT5Cascade()
+        elif name == "lit5_bioasq_lora":
+            from .lit5 import LiT5Reranker
+            inst = LiT5Reranker(lora_adapter=config.CHECKPOINTS["lit5_bioasq_lora"])
+        elif name == "lit5_bioasq_lora_e1":
+            from .lit5 import LiT5Reranker
+            inst = LiT5Reranker(lora_adapter=config.CHECKPOINTS["lit5_bioasq_lora_e1"])
+        elif name == "lit5_bioasq_lora_e3":
+            from .lit5 import LiT5Reranker
+            inst = LiT5Reranker(lora_adapter=config.CHECKPOINTS["lit5_bioasq_lora_e3"])
+        elif name == "lit5_bioasq_lora_kaggle":
+            from .lit5 import LiT5Reranker
+            inst = LiT5Reranker(lora_adapter=config.CHECKPOINTS["lit5_bioasq_lora_kaggle"])
+        elif name == "lit5_bioasq_lora_kaggle_e1":
+            from .lit5 import LiT5Reranker
+            inst = LiT5Reranker(lora_adapter=config.CHECKPOINTS["lit5_bioasq_lora_kaggle_e1"])
+        elif name == "lit5_bioasq_lora_kaggle_e2":
+            from .lit5 import LiT5Reranker
+            inst = LiT5Reranker(lora_adapter=config.CHECKPOINTS["lit5_bioasq_lora_kaggle_e2"])
+        elif name == "lit5_bioasq_lora_kaggle_e3":
+            from .lit5 import LiT5Reranker
+            inst = LiT5Reranker(lora_adapter=config.CHECKPOINTS["lit5_bioasq_lora_kaggle_e3"])
+        elif name == "lit5_bioasq_lora_kaggle_e4":
+            from .lit5 import LiT5Reranker
+            inst = LiT5Reranker(lora_adapter=config.CHECKPOINTS["lit5_bioasq_lora_kaggle_e4"])
+        # elif name == "mono_entropy_h50_lit5":
+        #     from .cascade import MonoEntropyH50GatedLiT5Cascade
+        #     inst = MonoEntropyH50GatedLiT5Cascade()
         elif name == "mono_entropy_h50_duo":
             from .cascade import MonoEntropyH50GatedDuoCascade
             inst = MonoEntropyH50GatedDuoCascade()
@@ -165,6 +207,24 @@ def get(name: str) -> Reranker:
         elif name == "bm25_biobert":
             from .cascade import BM25BioBERTCascade
             inst = BM25BioBERTCascade()
+        elif name == "qwen06b_lf":
+            from .cascade import Qwen06BLFCascade
+            inst = Qwen06BLFCascade()
+        elif name == "qwen06b_lf_999":
+            from .cascade import Qwen06BLF999Cascade
+            inst = Qwen06BLF999Cascade()
+        elif name == "qwen06b_lf_999_lit5":
+            from .cascade import Qwen06BLF999LiT5Cascade
+            inst = Qwen06BLF999LiT5Cascade()
+        elif name == "qwen06b_lf_999_duot5_unc_lit5":
+            from .cascade import Qwen06BLF999DuoUncLiT5Cascade
+            inst = Qwen06BLF999DuoUncLiT5Cascade()
+        elif name == "qwen06b_lf_lit5":
+            from .cascade import Qwen06BLFLiT5Cascade
+            inst = Qwen06BLFLiT5Cascade()
+        elif name == "qwen06b_lf_duot5_unc_lit5":
+            from .cascade import Qwen06BLFDuoUncLiT5Cascade
+            inst = Qwen06BLFDuoUncLiT5Cascade()
         else:
             raise ValueError(f"Unknown reranker: {name}")
 

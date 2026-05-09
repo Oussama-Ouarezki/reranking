@@ -43,18 +43,30 @@ def _parse_ranking(perm_text: str, n: int) -> list[int]:
 class LiT5Reranker:
     name = "lit5"
 
-    def __init__(self, checkpoint=None, device: str | None = None):
+    def __init__(self, checkpoint=None, lora_adapter=None, device: str | None = None):
         self.checkpoint = str(checkpoint or config.CHECKPOINTS["lit5"])
+        self.lora_adapter = str(lora_adapter) if lora_adapter else None
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
+        # Tokenizer: prefer the adapter dir if it ships one, else the base.
+        tok_src = self.lora_adapter or self.checkpoint
         self.tokenizer = T5Tokenizer.from_pretrained(
-            self.checkpoint, legacy=False, use_fast=True
+            tok_src, legacy=False, use_fast=True
         )
-        self.model = T5ForConditionalGeneration.from_pretrained(
+
+        base = T5ForConditionalGeneration.from_pretrained(
             self.checkpoint,
-            #torch_dtype=torch.bfloat16 if self.device == "cuda" else torch.float32,
-            torch_dtype=torch.float16
+            torch_dtype=torch.float16,
         ).to(self.device)
+
+        if self.lora_adapter:
+            from peft import PeftModel
+            peft_model = PeftModel.from_pretrained(base, self.lora_adapter).to(self.device)
+            # Merge LoRA into base weights for inference-time speed/parity with full FT.
+            self.model = peft_model.merge_and_unload()
+        else:
+            self.model = base
+
         self.model.eval()
 
     def _rerank_window(self, query: str, window: list[tuple[str, str]]) -> list[tuple[str, str]]:

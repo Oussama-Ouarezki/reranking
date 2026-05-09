@@ -1,4 +1,4 @@
-"""Qwen3-Reranker-4B — generative pointwise reranker, FP16.
+"""Qwen3-Reranker — generative pointwise reranker, FP16.
 
 The official Qwen3-Reranker recipe: format (instruction, query, doc) inside a
 chat template, take the last-token logits, and read P(yes) / [P(yes)+P(no)] as
@@ -15,6 +15,7 @@ from ._bm25_inject import inject as _bm25_inject
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 CHECKPOINT = "Qwen/Qwen3-Reranker-4B"
+CHECKPOINT_06B = "Qwen/Qwen3-Reranker-0.6B"
 INSTRUCTION = (
     "Given a biomedical question, retrieve PubMed abstracts that answer the question."
 )
@@ -32,14 +33,15 @@ MAX_LENGTH = 1024
 
 class Qwen3Reranker4B:
     name = "qwen3_reranker_4b"
+    checkpoint = CHECKPOINT
 
     def __init__(self, batch_size: int = 1, device: str | None = None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.batch_size = batch_size
 
-        self.tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT, padding_side="left")
+        self.tokenizer = AutoTokenizer.from_pretrained(self.checkpoint, padding_side="left")
         self.model = AutoModelForCausalLM.from_pretrained(
-            CHECKPOINT,
+            self.checkpoint,
             torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
             low_cpu_mem_usage=True,
         ).to(self.device)
@@ -100,3 +102,11 @@ class Qwen3Reranker4B:
             if self.device == "cuda":
                 torch.cuda.empty_cache()
         return sorted(zip(docids, scores), key=lambda x: x[1], reverse=True)
+
+
+class Qwen3Reranker06B(Qwen3Reranker4B):
+    name = "qwen3_reranker_0_6b"
+    checkpoint = CHECKPOINT_06B
+
+    def __init__(self, batch_size: int = 8, device: str | None = None):
+        super().__init__(batch_size=batch_size, device=device)

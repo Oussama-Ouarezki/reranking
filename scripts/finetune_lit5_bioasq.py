@@ -49,7 +49,7 @@ plt.style.use("ggplot")
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent.parent
-RERANKED_FILE  = ROOT / "data/bioasq/reranked/deepseek_oracle_hybrid.jsonl"
+RERANKED_FILE  = ROOT / "lit5 fine tuning/windowed_train.jsonl"
 FULL_CORPUS    = ROOT / "data/bioasq/pubmed_full/full/corpus_full_processed.jsonl"
 QUERIES_FILE   = ROOT / "data/bioasq/processed/queries.jsonl"
 QRELS_FILE     = ROOT / "data/bioasq/processed/qrels.tsv"

@@ -10,7 +10,17 @@ from .. import config
 from ..rerankers import registry as rerank_registry
 from ..generation import rag
 from ..evaluation.ranking import per_query_metrics
+from ..evaluation import qa_metrics
 from ..schemas import ChatRequest, ChatResponse, RankingMetrics, RetrievedDoc, Timings
+
+# Same labels as the generation router uses, so the ChatPage shows the same
+# "MRR / Acc / F1 / Judge" caption that GenerationPage does.
+QTYPE_METRIC_LABEL = {
+    "factoid": "MRR",
+    "yesno": "Acc",
+    "list": "F1",
+    "summary": "Judge",
+}
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -150,6 +160,37 @@ def chat(req: ChatRequest) -> ChatResponse:
             m = per_query_metrics(req.query_id, full_ranked, qrels)
             metrics = RankingMetrics(**m)
 
+    # 9. QA scoring on the generated answer (when we have a known query with
+    #    gold answers attached). Mirrors what the generation router does so the
+    #    Chat page can show the same single-query QA metric.
+    qa_score: float | None = None
+    qa_metric_label: str | None = None
+    qa_extra: dict | None = None
+    if (
+        req.query_id
+        and req.generate
+        and qtype
+        and answer
+        and not no_relevant
+        and not answer.startswith("[generation error")
+    ):
+        query_obj = None
+        for q in deps.get_queries():
+            if q["_id"] == req.query_id:
+                query_obj = q
+                break
+        if query_obj is not None:
+            try:
+                full = qa_metrics.score_answer_full(
+                    qtype, answer, query_obj, skip_judge=req.skip_judge,
+                )
+                if full.get("qa_score") is not None:
+                    qa_score = float(full["qa_score"])
+                qa_metric_label = QTYPE_METRIC_LABEL.get(qtype)
+                qa_extra = {k: v for k, v in full.items() if k != "qa_score"} or None
+            except Exception:
+                log.exception("qa scoring failed for qid=%s", req.query_id)
+
     timings = Timings(
         retrieve_s=round(t_retrieve, 4),
         rerank_s=round(t_rerank, 4),
@@ -167,4 +208,7 @@ def chat(req: ChatRequest) -> ChatResponse:
         metrics=metrics,
         timings=timings,
         n_relevant_retrieved=n_relevant_retrieved,
+        qa_score=qa_score,
+        qa_metric_label=qa_metric_label,
+        qa_extra=qa_extra,
     )

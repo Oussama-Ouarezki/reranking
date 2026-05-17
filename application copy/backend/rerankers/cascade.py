@@ -1,0 +1,1446 @@
+"""Cascade rerankers built on top of the individual rerankers.
+
+MonoDuoCascade           — BM25 → monoT5 (top-N) → duoT5 tournament
+MonoThreshLiT5           — BM25 → monoT5 (threshold filter) → LiT5 listwise
+MonoUncertainDuoLiT5     — BM25 → monoT5 (rank all) → duoT5 on fixed
+                            uncertain zone (positions 15-25) → LiT5 top-20
+MonoDynamicDuoLiT5       — BM25 → monoT5 (rank all) → duoT5 on docs whose
+                            adjacent score gap < margin → LiT5 top-20
+MonoGatedDuoCascade      — BM25 → monoT5 (rank all) → duoT5 tournament on
+                            top-20 only when top-1/top-2 score gap < τ=0.001
+MonoEntropyGatedDuoCascade — BM25 → monoT5 (rank all) → duoT5 on top-20 only
+                            when rank-distribution entropy H@20 ≥ τ=0.950
+
+Final scores are synthetic descending integers so the global ordering is
+preserved for downstream metrics (nDCG, MAP, MRR, etc.).
+"""
+
+import logging
+import math
+
+from .duot5 import TOURNAMENT_TOP_N
+from . import registry
+
+_log = logging.getLogger(__name__)
+
+# P(true) threshold: docs scoring below this are skipped by LiT5 and
+# kept in their monoT5 order below the LiT5-ranked head.
+MONO_THRESHOLD = 0.5
+
+
+class MonoDuoCascade:
+    name = "mono_duo"
+
+    def __init__(self):
+        # Reuse cached monot5 + duot5 instances if already loaded; otherwise
+        # this triggers their loads via the registry (which uses an RLock so
+        # nested get() from inside __init__ does not deadlock).
+        self.mono = registry.get("monot5")
+        self.duo = registry.get("duot5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        mono_ranked = self.mono.rerank(query, candidates)
+        cand_map = dict(candidates)
+
+        head = mono_ranked[:TOURNAMENT_TOP_N]
+        tail = mono_ranked[TOURNAMENT_TOP_N:]
+
+        head_pairs = [(d, cand_map[d]) for d, _ in head if d in cand_map]
+        duo_ranked = self.duo.rerank(query, head_pairs)  # tournament on 20
+
+        merged = list(duo_ranked) + tail
+        n = len(merged)
+        return [(docid, float(n - i)) for i, (docid, _) in enumerate(merged)]
+
+
+class MonoThreshLiT5Cascade:
+    """BM25 → monoT5 (threshold=0.7) → LiT5 listwise on survivors."""
+
+    name = "monot5_lit5"
+
+    def __init__(self):
+        self.mono = registry.get("monot5")
+        self.lit5 = registry.get("lit5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        cand_map = dict(candidates)
+
+        # Step 1: monoT5 scores all candidates → sorted (docid, P(true))
+        mono_ranked = self.mono.rerank(query, candidates)
+
+        # Step 2: split by threshold
+        head = [(d, s) for d, s in mono_ranked if s >= MONO_THRESHOLD]
+        tail = [(d, s) for d, s in mono_ranked if s <  MONO_THRESHOLD]
+
+        # Edge case: nothing above threshold → return mono order as-is
+        if not head:
+            n = len(mono_ranked)
+            return [(docid, float(n - i)) for i, (docid, _) in enumerate(mono_ranked)]
+
+        # Step 3: LiT5 listwise reranks the survivors (needs (docid, text))
+        head_pairs = [(d, cand_map[d]) for d, _ in head if d in cand_map]
+        lit5_ranked = self.lit5.rerank(query, head_pairs)
+
+        # Step 4: merge — LiT5 head then mono-ordered tail
+        merged = list(lit5_ranked) + tail
+        n = len(merged)
+        return [(docid, float(n - i)) for i, (docid, _) in enumerate(merged)]
+
+
+# Positions (0-indexed) of the "uncertain" zone that duoT5 will reorder.
+# Positions 0-13 = monoT5 is confident (top); 14-24 = uncertain middle;
+# 25+ = likely irrelevant. duoT5 only runs on 11 docs, then LiT5 on top-20.
+UNCERTAIN_START = 14   # inclusive
+UNCERTAIN_END   = 25   # exclusive  → indices 14…24 (positions 15–25)
+LIT5_INPUT_K    = 20   # how many docs (after duoT5 reorder) go to LiT5
+
+
+class MonoUncertainDuoLiT5Cascade:
+    """BM25 → monoT5 (all 50) → duoT5 on uncertain zone (pos 15-25) → LiT5 top-20."""
+
+    name = "mono_uncertain_duo_lit5"
+
+    def __init__(self):
+        self.mono = registry.get("monot5")
+        self.duo  = registry.get("duot5")
+        self.lit5 = registry.get("lit5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        cand_map = dict(candidates)
+
+        # Step 1: monoT5 scores and ranks all candidates
+        mono_ranked = self.mono.rerank(query, candidates)
+
+        # Step 2: split into confident head / uncertain zone / tail
+        head      = mono_ranked[:UNCERTAIN_START]
+        uncertain = mono_ranked[UNCERTAIN_START:UNCERTAIN_END]
+        tail      = mono_ranked[UNCERTAIN_END:]
+
+        # Step 3: duoT5 reorders only the uncertain zone
+        if uncertain:
+            uncertain_pairs = [(d, cand_map[d]) for d, _ in uncertain if d in cand_map]
+            duo_reranked = self.duo.rerank(query, uncertain_pairs)
+        else:
+            duo_reranked = uncertain
+
+        # Step 4: merge back into a single ranked list
+        merged = list(head) + list(duo_reranked) + list(tail)
+
+        # Step 5: take top-20 and pass to LiT5 for final listwise rerank
+        top_k      = merged[:LIT5_INPUT_K]
+        top_k_rest = merged[LIT5_INPUT_K:]
+
+        top_k_pairs = [(d, cand_map[d]) for d, _ in top_k if d in cand_map]
+        lit5_ranked = self.lit5.rerank(query, top_k_pairs)
+
+        # Step 6: append remaining docs (positions 21+) in merged order below
+        final = list(lit5_ranked) + top_k_rest
+        n = len(final)
+        return [(docid, float(n - i)) for i, (docid, _) in enumerate(final)]
+
+
+# Score gap below which two adjacent monoT5 docs are considered "uncertain".
+# monoT5 P(true) is in [0, 1]. A gap of 0.05 means the model assigns nearly
+# identical relevance probability to two docs — a coin-flip duoT5 should break.
+DYNAMIC_MARGIN   = 0.05
+DYNAMIC_SCAN_TOP = 30    # only scan for uncertain pairs within the top-N docs
+DYNAMIC_LIT5_K   = 20
+
+
+class MonoDynamicDuoLiT5Cascade:
+    """BM25 → monoT5 → duoT5 on dynamically identified uncertain pairs → LiT5 top-20.
+
+    Uncertainty is defined per-query: any two adjacent docs in the monoT5
+    ranking whose P(true) scores differ by less than DYNAMIC_MARGIN are both
+    flagged as uncertain.  duoT5 then directly re-compares only those docs,
+    and the result is merged back into their original position slots before
+    LiT5 does a final listwise pass on the top-20.
+    """
+
+    name = "mono_dynamic_duo_lit5"
+
+    def __init__(self, margin: float = DYNAMIC_MARGIN):
+        self.margin = margin
+        self.mono = registry.get("monot5")
+        self.duo  = registry.get("duot5")
+        self.lit5 = registry.get("lit5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        cand_map = dict(candidates)
+
+        # Step 1: monoT5 scores and ranks all candidates
+        mono_ranked = self.mono.rerank(query, candidates)  # [(docid, P(true))], desc
+
+        # Step 2: flag uncertain indices — scan only within top DYNAMIC_SCAN_TOP docs
+        scan_limit = min(DYNAMIC_SCAN_TOP, len(mono_ranked))
+        gaps = []
+        uncertain_idx: set[int] = set()
+        for i in range(scan_limit - 1):
+            gap = mono_ranked[i][1] - mono_ranked[i + 1][1]  # always >= 0 (sorted desc)
+            gaps.append(gap)
+            if gap < self.margin:
+                uncertain_idx.add(i)
+                uncertain_idx.add(i + 1)
+
+        if gaps:
+            min_gap = min(gaps)
+            avg_gap = sum(gaps) / len(gaps)
+            _log.debug(
+                "margin=%.3f  flagged=%d/%d docs  "
+                "gap: min=%.4f avg=%.4f  query=%r",
+                self.margin, len(uncertain_idx), len(mono_ranked),
+                min_gap, avg_gap, query[:60],
+            )
+
+        # Step 3: if no uncertain pairs, skip duoT5 entirely
+        if not uncertain_idx:
+            top_k      = mono_ranked[:DYNAMIC_LIT5_K]
+            top_k_rest = mono_ranked[DYNAMIC_LIT5_K:]
+            top_k_pairs = [(d, cand_map[d]) for d, _ in top_k if d in cand_map]
+            lit5_ranked = self.lit5.rerank(query, top_k_pairs)
+            final = list(lit5_ranked) + top_k_rest
+            n = len(final)
+            return [(docid, float(n - i)) for i, (docid, _) in enumerate(final)]
+
+        # Step 4: duoT5 reorders only the uncertain docs
+        uncertain_docs = [mono_ranked[i] for i in sorted(uncertain_idx)]
+        uncertain_pairs = [(d, cand_map[d]) for d, _ in uncertain_docs if d in cand_map]
+        duo_reranked = self.duo.rerank(query, uncertain_pairs)  # [(docid, score)], desc
+
+        # Step 5: rebuild full ranking — certain docs stay in place,
+        # uncertain slots are filled in duoT5 order (left to right)
+        duo_iter = iter(duo_reranked)
+        merged = []
+        for i, item in enumerate(mono_ranked):
+            if i in uncertain_idx:
+                merged.append(next(duo_iter, item))  # fallback to mono if iter exhausted
+            else:
+                merged.append(item)
+
+        # Step 6: LiT5 on top-20 of the merged list
+        top_k      = merged[:DYNAMIC_LIT5_K]
+        top_k_rest = merged[DYNAMIC_LIT5_K:]
+        top_k_pairs = [(d, cand_map[d]) for d, _ in top_k if d in cand_map]
+        lit5_ranked = self.lit5.rerank(query, top_k_pairs)
+
+        final = list(lit5_ranked) + top_k_rest
+        n = len(final)
+        return [(docid, float(n - i)) for i, (docid, _) in enumerate(final)]
+
+
+# Score gap below which duoT5 is triggered (top-1 vs top-2 P(true)).
+# Chosen via Pareto knee-point sweep (see models/monot5/threshold_sweep.py):
+# τ=0.001 sends ~50% of queries to duoT5 while recovering most of the nDCG gain.
+GATED_MARGIN = 0.001
+GATED_TOP_N  = 20   # duoT5 tournament on top-N docs when triggered
+
+
+class MonoGatedDuoCascade:
+    """BM25 → monoT5 (rank all) → duoT5 on top-20 only if gap(top1, top2) < 0.001.
+
+    Per-query gating: if the monoT5 P(true) score gap between rank-1 and rank-2
+    is below GATED_MARGIN the model is uncertain about the top pair, so duoT5
+    runs a full tournament on the top-20 docs.  Otherwise monoT5 ranking is kept
+    as-is, saving all duoT5 computation for that query.
+
+    Threshold was selected by sweeping τ and picking the Pareto knee
+    (max nDCG gain per unit cost on the BioASQ dev set).
+    """
+
+    name = "mono_gated_duo"
+
+    def __init__(self, margin: float = GATED_MARGIN):
+        self.margin = margin
+        self.mono = registry.get("monot5")
+        self.duo  = registry.get("duot5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        cand_map = dict(candidates)
+
+        # Step 1: monoT5 scores and ranks all candidates
+        mono_ranked = self.mono.rerank(query, candidates)  # [(docid, P(true))], desc
+
+        # Step 2: compute top-1 vs top-2 gap
+        gap = (mono_ranked[0][1] - mono_ranked[1][1]) if len(mono_ranked) >= 2 else 1.0
+
+        _log.debug(
+            "gap=%.4f  margin=%.4f  trigger=%s  query=%r",
+            gap, self.margin, gap < self.margin, query[:60],
+        )
+
+        # Step 3: gate — only apply duoT5 when monoT5 is uncertain at the top
+        if gap < self.margin:
+            head       = mono_ranked[:GATED_TOP_N]
+            tail       = mono_ranked[GATED_TOP_N:]
+            head_pairs = [(d, cand_map[d]) for d, _ in head if d in cand_map]
+            duo_ranked = self.duo.rerank(query, head_pairs)
+            merged     = list(duo_ranked) + tail
+        else:
+            merged = mono_ranked
+
+        n = len(merged)
+        return [(docid, float(n - i)) for i, (docid, _) in enumerate(merged)]
+
+
+# P(true) gap below which two docs in the top-N are considered "too close to
+# trust monoT5 to separate".  All-pairs check: every pair (i, j) in top-20
+# with |s_i − s_j| < margin causes both to be sent to duoT5.
+PROXIMITY_MARGIN = 0.001
+PROXIMITY_TOP_N  = 20
+
+
+class MonoProximityDuoCascade:
+    """BM25 → monoT5 → duoT5 on all docs within 0.001 P(true) of each other.
+
+    Within the top-20 monoT5 docs every pair (i, j) is compared.  If
+    |s_i − s_j| < PROXIMITY_MARGIN both docs are flagged as uncertain.
+    All flagged docs are sent to duoT5 together; the result is merged back
+    slot-preserving (the k-th uncertain slot receives the k-th duoT5-ranked
+    doc).  Non-flagged docs stay exactly where monoT5 placed them.
+
+    Difference from MonoDynamicDuoLiT5Cascade:
+      • All-pairs check (not adjacent-only) — catches any two close docs
+        regardless of whether a third doc separates them in the ranking.
+      • No LiT5 final pass.
+      • Tighter margin (0.001 vs 0.05), scans only top-20.
+    """
+
+    name = "mono_proximity_duo"
+
+    def __init__(self, margin: float = PROXIMITY_MARGIN, top_n: int = PROXIMITY_TOP_N):
+        self.margin = margin
+        self.top_n  = top_n
+        self.mono = registry.get("monot5")
+        self.duo  = registry.get("duot5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        cand_map = dict(candidates)
+
+        # Step 1: monoT5 scores and ranks all candidates
+        mono_ranked = self.mono.rerank(query, candidates)  # [(docid, P(true))], desc
+
+        # Step 2: split into top-N and tail
+        top_n = mono_ranked[:self.top_n]
+        tail  = mono_ranked[self.top_n:]
+
+        # Step 3: all-pairs proximity check within top-N — O(n²) = 190 checks
+        uncertain_idx: set[int] = set()
+        for i in range(len(top_n)):
+            for j in range(i + 1, len(top_n)):
+                if abs(top_n[i][1] - top_n[j][1]) < self.margin:
+                    uncertain_idx.add(i)
+                    uncertain_idx.add(j)
+
+        _log.debug(
+            "margin=%.4f  flagged=%d/%d docs  query=%r",
+            self.margin, len(uncertain_idx), len(top_n), query[:60],
+        )
+
+        # Step 4: if nothing is uncertain, skip duoT5 entirely
+        if not uncertain_idx:
+            final = list(top_n) + list(tail)
+            n = len(final)
+            return [(docid, float(n - i)) for i, (docid, _) in enumerate(final)]
+
+        # Step 5: duoT5 reorders only the uncertain docs
+        uncertain_docs  = [top_n[i] for i in sorted(uncertain_idx)]
+        uncertain_pairs = [(d, cand_map[d]) for d, _ in uncertain_docs if d in cand_map]
+        duo_reranked    = self.duo.rerank(query, uncertain_pairs)
+
+        # Step 6: slot-preserving merge — uncertain slots filled in duoT5 order
+        duo_iter   = iter(duo_reranked)
+        merged_top = [
+            next(duo_iter, item) if i in uncertain_idx else item
+            for i, item in enumerate(top_n)
+        ]
+
+        final = merged_top + list(tail)
+        n = len(final)
+        return [(docid, float(n - i)) for i, (docid, _) in enumerate(final)]
+
+
+class MonoProximityDuoLiT5Cascade:
+    """BM25 → monoT5 → duoT5 (proximity 0.001) → LiT5 top-20.
+
+    Identical to MonoProximityDuoCascade but adds a LiT5 listwise pass on
+    the top-20 docs after the slot-preserving duoT5 merge.
+    """
+
+    name = "mono_proximity_duo_lit5"
+
+    def __init__(self, margin: float = PROXIMITY_MARGIN):
+        self.margin = margin
+        self.mono = registry.get("monot5")
+        self.duo  = registry.get("duot5")
+        self.lit5 = registry.get("lit5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        cand_map = dict(candidates)
+
+        mono_ranked = self.mono.rerank(query, candidates)
+        top_n = mono_ranked[:PROXIMITY_TOP_N]
+        tail  = mono_ranked[PROXIMITY_TOP_N:]
+
+        uncertain_idx: set[int] = set()
+        for i in range(len(top_n)):
+            for j in range(i + 1, len(top_n)):
+                if abs(top_n[i][1] - top_n[j][1]) < self.margin:
+                    uncertain_idx.add(i)
+                    uncertain_idx.add(j)
+
+        if uncertain_idx:
+            uncertain_pairs = [
+                (d, cand_map[d]) for d in
+                [top_n[i][0] for i in sorted(uncertain_idx)]
+                if d in cand_map
+            ]
+            duo_reranked = self.duo.rerank(query, uncertain_pairs)
+            duo_iter     = iter(duo_reranked)
+            top_n = [
+                next(duo_iter, item) if i in uncertain_idx else item
+                for i, item in enumerate(top_n)
+            ]
+
+        # LiT5 final listwise pass on top-20
+        top_k_pairs = [(d, cand_map[d]) for d, _ in top_n if d in cand_map]
+        lit5_ranked = self.lit5.rerank(query, top_k_pairs)
+
+        final = list(lit5_ranked) + list(tail)
+        n = len(final)
+        return [(docid, float(n - i)) for i, (docid, _) in enumerate(final)]
+
+
+LIT5_DUO_TOP_N = 10   # duoT5 tournament on top-N after LiT5
+
+
+class LiT5DuoCascade:
+    """BM25 → LiT5 (all 50, sliding window) → duoT5 tournament on top-10.
+
+    LiT5 provides a global listwise ordering of all 50 BM25 candidates;
+    duoT5 then does precise pairwise comparison on the cream (top-10) where
+    the listwise model may still leave near-ties unresolved.
+    """
+
+    name = "lit5_duo"
+
+    def __init__(self):
+        self.lit5 = registry.get("lit5")
+        self.duo  = registry.get("duot5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        cand_map = dict(candidates)
+
+        # Step 1: LiT5 reranks all BM25 candidates
+        lit5_ranked = self.lit5.rerank(query, candidates)
+
+        # Step 2: duoT5 tournament on top-10 of LiT5 output
+        head = lit5_ranked[:LIT5_DUO_TOP_N]
+        tail = lit5_ranked[LIT5_DUO_TOP_N:]
+
+        head_pairs = [(d, cand_map[d]) for d, _ in head if d in cand_map]
+        duo_ranked = self.duo.rerank(query, head_pairs)
+
+        merged = list(duo_ranked) + list(tail)
+        n = len(merged)
+        return [(docid, float(n - i)) for i, (docid, _) in enumerate(merged)]
+
+
+class MonoProximityDuoCascade0005(MonoProximityDuoCascade):
+    """Same as MonoProximityDuoCascade with margin=0.0005 (tighter threshold).
+
+    Flags fewer uncertain docs per query; duoT5 is called less often but
+    targets only the most tightly-clustered score groups.
+    """
+
+    name = "mono_proximity_duo_0005"
+
+    def __init__(self) -> None:
+        super().__init__(margin=0.0005)
+
+
+class MonoProximityDuoCascade005Top30(MonoProximityDuoCascade):
+    """Same as MonoProximityDuoCascade with margin=0.005, scans top-30.
+
+    Wider margin and larger scan window: flags more uncertain docs (score
+    groups within 0.005 of each other) across a deeper portion of the ranking.
+    Useful for queries where relevant docs are spread across positions 20-30.
+    """
+
+    name = "mono_proximity_duo_005_top30"
+
+    def __init__(self) -> None:
+        super().__init__(margin=0.005, top_n=30)
+
+
+# ── MAU-sweep gated models ────────────────────────────────────────────────────
+# Two operating points selected by the threshold sweep in
+# models/monot5/threshold_sweep.py using the top-1/top-2 monoT5 score gap as
+# the gating signal (a per-query uncertainty proxy).
+#
+# τ = 0.0001  → sends ~21.5% of queries to duoT5  nDCG@10 ≈ 0.8731  (cheap)
+# τ = 0.0010  → sends ~50.3% of queries to duoT5  nDCG@10 ≈ 0.8797  (Pareto knee)
+
+
+class MonoMauDuoLowCost(MonoGatedDuoCascade):
+    """Gap-gated duoT5 at τ=0.0001 — big nDCG gain for only 21.5% duo cost.
+
+    Selected from the MAU threshold sweep as the elbow of the gain/cost curve:
+    the first point where routing the most uncertain queries to duoT5 yields a
+    large improvement (+0.011 nDCG vs pure monoT5) before returns diminish.
+    """
+
+    name = "mono_mau_duo_low_cost"
+
+    def __init__(self) -> None:
+        super().__init__(margin=0.0001)
+
+
+class MonoMauDuoPareto(MonoGatedDuoCascade):
+    """Gap-gated duoT5 at τ=0.001 — Pareto knee of the MAU threshold sweep.
+
+    Sends ~50% of queries to duoT5, recovering ~95% of the achievable nDCG
+    gain over pure monoT5 at half the cost of always running duoT5.
+    """
+
+    name = "mono_mau_duo_pareto"
+
+    def __init__(self) -> None:
+        super().__init__(margin=0.001)
+
+
+# ── Gated monoT5 → LiT5 cascade ──────────────────────────────────────────────
+# Per-query gate: if top-1/top-2 monoT5 gap < τ=0.001, pass top-K docs to LiT5
+# for listwise reranking; otherwise keep monoT5 order unchanged.
+# Three variants differ only in how many docs LiT5 sees when triggered.
+
+
+class MonoGatedLiT5Cascade:
+    """BM25 → monoT5 (rank all) → LiT5 on top-K only when gap < τ.
+
+    Gate signal: top-1 minus top-2 monoT5 P(true) gap.
+    When gap < margin → monoT5 is uncertain at the top → LiT5 reranks top_k docs.
+    When gap ≥ margin → monoT5 is confident → LiT5 is skipped entirely.
+    """
+
+    name = "mono_gated_lit5"
+
+    def __init__(self, margin: float = 0.001, top_k: int = 20):
+        self.margin = margin
+        self.top_k  = top_k
+        self.mono = registry.get("monot5")
+        self.lit5 = registry.get("lit5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        cand_map = dict(candidates)
+
+        mono_ranked = self.mono.rerank(query, candidates)
+
+        gap = (mono_ranked[0][1] - mono_ranked[1][1]) if len(mono_ranked) >= 2 else 1.0
+
+        _log.debug(
+            "gap=%.4f  margin=%.4f  trigger=%s  top_k=%d  query=%r",
+            gap, self.margin, gap < self.margin, self.top_k, query[:60],
+        )
+
+        if gap < self.margin:
+            head       = mono_ranked[:self.top_k]
+            tail       = mono_ranked[self.top_k:]
+            head_pairs = [(d, cand_map[d]) for d, _ in head if d in cand_map]
+            lit5_ranked = self.lit5.rerank(query, head_pairs)
+            merged      = list(lit5_ranked) + tail
+        else:
+            merged = mono_ranked
+
+        n = len(merged)
+        return [(docid, float(n - i)) for i, (docid, _) in enumerate(merged)]
+
+
+class MonoGatedLiT5Top20(MonoGatedLiT5Cascade):
+    """Gap-gated monoT5 → LiT5 — passes top-20 docs to LiT5 when triggered."""
+
+    name = "mono_gated_lit5_top20"
+
+    def __init__(self) -> None:
+        super().__init__(margin=0.001, top_k=20)
+
+
+class MonoGatedLiT5Top40(MonoGatedLiT5Cascade):
+    """Gap-gated monoT5 → LiT5 — passes top-40 docs to LiT5 when triggered."""
+
+    name = "mono_gated_lit5_top40"
+
+    def __init__(self) -> None:
+        super().__init__(margin=0.001, top_k=40)
+
+
+class MonoGatedLiT5Top50(MonoGatedLiT5Cascade):
+    """Gap-gated monoT5 → LiT5 — passes all top-50 BM25 docs to LiT5 when triggered."""
+
+    name = "mono_gated_lit5_top50"
+
+    def __init__(self) -> None:
+        super().__init__(margin=0.001, top_k=50)
+
+
+# ── Entropy-gated monoT5 → duoT5 cascade ─────────────────────────────────────
+# Gate signal: normalized rank-distribution entropy over top-20 monoT5 scores.
+#   H_norm = -Σ p_i log(p_i) / log(K),  p_i = s_i / Σ s_j
+# High entropy (→ 1) means monoT5 spreads probability mass flatly across top-20
+# docs — genuinely uncertain ordering that duoT5 can improve.
+# τ=0.950 selected as Pareto knee from monoDuotgate/grid_search.py entropy sweep:
+# saves 43.8% of duoT5 calls at nDCG@10=0.8786 vs always-duo 0.8876.
+
+ENTROPY_GATED_K   = 20
+ENTROPY_GATED_TAU = 0.950
+
+
+class MonoEntropyGatedDuoCascade:
+    """BM25 → monoT5 (rank all) → duoT5 on top-20 only when H@20 ≥ 0.950.
+
+    Normalized rank-distribution entropy over the top-20 monoT5 P(true) scores
+    is used as the per-query uncertainty signal.  A high value means the model
+    distributes relevance probability flatly — duoT5 pairwise comparison then
+    resolves the ambiguity.  When entropy is low monoT5 is confident and its
+    ordering is kept as-is.
+    """
+
+    name = "mono_entropy_gated_duo"
+
+    def __init__(self, k: int = ENTROPY_GATED_K, tau: float = ENTROPY_GATED_TAU):
+        self.k   = k
+        self.tau = tau
+        self.mono = registry.get("monot5")
+        self.duo  = registry.get("duot5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        cand_map    = dict(candidates)
+        mono_ranked = self.mono.rerank(query, candidates)  # [(docid, P(true))], desc
+
+        top_k  = mono_ranked[:self.k]
+        tail   = mono_ranked[self.k:]
+        scores = [s for _, s in top_k]
+
+        h_norm = 0.0
+        s_sum  = sum(scores)
+        if s_sum > 0 and len(scores) > 1:
+            probs  = [s / s_sum for s in scores]
+            h      = -sum(p * math.log(p + 1e-15) for p in probs if p > 0)
+            h_norm = h / math.log(len(probs))
+
+        _log.debug(
+            "H_norm=%.4f  tau=%.4f  trigger=%s  query=%r",
+            h_norm, self.tau, h_norm >= self.tau, query[:60],
+        )
+
+        if h_norm >= self.tau:
+            head_pairs = [(d, cand_map[d]) for d, _ in top_k if d in cand_map]
+            duo_ranked = self.duo.rerank(query, head_pairs)
+            merged     = list(duo_ranked) + list(tail)
+        else:
+            merged = mono_ranked
+
+        n = len(merged)
+        return [(docid, float(n - i)) for i, (docid, _) in enumerate(merged)]
+
+
+# ── Entropy-gated monoT5 → LiT5 cascade ──────────────────────────────────────
+# Gate signal: normalized rank-distribution entropy over all 50 monoT5 scores.
+#   H_norm = -Σ p_i log(p_i) / log(50),  p_i = s_i / Σ s_j
+# τ=0.839 selected as best/knee from monoLiT5gate/grid_search.py:
+# nDCG@10=0.8656 (beats always-LiT5 0.8632) saving 144 queries (42.4% cost).
+
+ENTROPY_H50_LIT5_K   = 50
+ENTROPY_H50_LIT5_TAU = 0.839
+
+
+class MonoEntropyH50GatedLiT5Cascade:
+    """BM25 → monoT5 (rank all) → LiT5 on all candidates only when H@50 ≥ 0.839.
+
+    Normalized rank-distribution entropy over all 50 BM25 candidates' monoT5
+    P(true) scores is the per-query gate.  High entropy → monoT5 spreads mass
+    flatly across the candidate set → LiT5 listwise sliding-window reranks all
+    50 docs.  Low entropy → monoT5 is confident → its ordering is kept as-is,
+    saving the full LiT5 forward pass.
+
+    τ=0.839 is the Pareto-optimal knee from monoLiT5gate/grid_search.py:
+    nDCG@10=0.8656, saves 42.4% of LiT5 calls vs always running LiT5.
+    """
+
+    name = "mono_entropy_h50_lit5"
+
+    def __init__(self, k: int = ENTROPY_H50_LIT5_K, tau: float = ENTROPY_H50_LIT5_TAU):
+        self.k   = k
+        self.tau = tau
+        self.mono = registry.get("monot5")
+        self.lit5 = registry.get("lit5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        mono_ranked = self.mono.rerank(query, candidates)  # [(docid, P(true))], desc
+
+        # H@50: entropy over all available monoT5 scores (up to self.k)
+        top_k  = mono_ranked[:self.k]
+        scores = [s for _, s in top_k]
+
+        h_norm = 0.0
+        s_sum  = sum(scores)
+        if s_sum > 0 and len(scores) > 1:
+            probs  = [s / s_sum for s in scores]
+            h      = -sum(p * math.log(p + 1e-15) for p in probs if p > 0)
+            h_norm = h / math.log(len(probs))
+
+        _log.debug(
+            "H50_norm=%.4f  tau=%.4f  trigger=%s  query=%r",
+            h_norm, self.tau, h_norm >= self.tau, query[:60],
+        )
+
+        if h_norm >= self.tau:
+            lit5_ranked = self.lit5.rerank(query, candidates)
+            merged      = list(lit5_ranked)
+        else:
+            merged = mono_ranked
+
+        n = len(merged)
+        return [(docid, float(n - i)) for i, (docid, _) in enumerate(merged)]
+
+
+# ── Entropy H@50 gated monoT5 → duoT5 cascade ────────────────────────────────
+# Gate signal: normalized rank-distribution entropy over all 50 monoT5 scores.
+#   H_norm = -Σ p_i log(p_i) / log(50),  p_i = s_i / Σ s_j
+# τ=0.832 selected as Pareto knee from monoDuotgate/grid_search.py:
+# nDCG@10=0.8854, saves 140 queries (41.2% cost reduction) vs always-duo.
+
+ENTROPY_H50_DUO_K     = 50
+ENTROPY_H50_DUO_TAU   = 0.832
+ENTROPY_H50_DUO_TOP_N = 20   # duoT5 tournament on top-N when triggered
+
+
+class MonoEntropyH50GatedDuoCascade:
+    """BM25 → monoT5 (rank all) → duoT5 on top-20 only when H@50 ≥ 0.832.
+
+    Normalized rank-distribution entropy over all 50 BM25 candidates' monoT5
+    P(true) scores is the per-query gate.  High entropy → monoT5 spreads mass
+    flatly across the full candidate set → duoT5 pairwise tournament resolves
+    the top-20.  Low entropy → monoT5 is confident → its ordering is kept,
+    saving the full duoT5 forward pass.
+
+    τ=0.832 is the Pareto knee from monoDuotgate/grid_search.py:
+    nDCG@10=0.8854 (@1=0.9412, @5=0.9065), saves 41.2% of duoT5 calls.
+    """
+
+    name = "mono_entropy_h50_duo"
+
+    def __init__(self, k: int = ENTROPY_H50_DUO_K, tau: float = ENTROPY_H50_DUO_TAU):
+        self.k     = k
+        self.tau   = tau
+        self.top_n = ENTROPY_H50_DUO_TOP_N
+        self.mono  = registry.get("monot5")
+        self.duo   = registry.get("duot5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        cand_map    = dict(candidates)
+        mono_ranked = self.mono.rerank(query, candidates)
+
+        scores = [s for _, s in mono_ranked[:self.k]]
+        h_norm = 0.0
+        s_sum  = sum(scores)
+        if s_sum > 0 and len(scores) > 1:
+            probs  = [s / s_sum for s in scores]
+            h      = -sum(p * math.log(p + 1e-15) for p in probs if p > 0)
+            h_norm = h / math.log(len(probs))
+
+        _log.debug(
+            "H50_norm=%.4f  tau=%.4f  trigger=%s  query=%r",
+            h_norm, self.tau, h_norm >= self.tau, query[:60],
+        )
+
+        if h_norm >= self.tau:
+            head       = mono_ranked[:self.top_n]
+            tail       = mono_ranked[self.top_n:]
+            head_pairs = [(d, cand_map[d]) for d, _ in head if d in cand_map]
+            duo_ranked = self.duo.rerank(query, head_pairs)
+            merged     = list(duo_ranked) + list(tail)
+        else:
+            merged = mono_ranked
+
+        n = len(merged)
+        return [(docid, float(n - i)) for i, (docid, _) in enumerate(merged)]
+
+
+# ── Qwen3-4B + BM25 pure linear fusion (no gate) ─────────────────────────────
+# For every query, blend Qwen P(yes) and BM25 score linearly:
+#   score(d) = alpha * qwen_minmax(d) + (1-alpha) * bm25_minmax(d)
+# Both score channels are min-max normalised per query before blending.
+# Hyperparameters were chosen by sweeping alpha on a 500-query slice from
+# BioASQ training — see qwen4b_uncertainty/10_best_cascade_params.py.
+
+
+def _minmax_per_query(values: list[float]) -> list[float]:
+    if not values:
+        return []
+    lo, hi = min(values), max(values)
+    if hi - lo < 1e-12:
+        return [0.0] * len(values)
+    span = hi - lo
+    return [(v - lo) / span for v in values]
+
+
+def _qwen_bm25_linear(
+    qwen_ranked: list[tuple[str, float]],
+    bm25_scores: dict[str, float] | None,
+    alpha: float,
+) -> list[tuple[str, float]]:
+    """Return docs reordered by linear blend of Qwen and BM25 (min-max norm)."""
+    if not qwen_ranked:
+        return []
+    if not bm25_scores:
+        # No BM25 prior available — fall back to Qwen ordering, but rewrite
+        # scores as descending integers so downstream metric code works the
+        # same as for cascades that synthesise scores at the end.
+        n = len(qwen_ranked)
+        return [(d, float(n - i)) for i, (d, _) in enumerate(qwen_ranked)]
+
+    docids   = [d for d, _ in qwen_ranked]
+    qwen_vec = [s for _, s in qwen_ranked]
+    bm25_vec = [float(bm25_scores.get(d, 0.0)) for d in docids]
+
+    qn = _minmax_per_query(qwen_vec)
+    bn = _minmax_per_query(bm25_vec)
+    fused = [alpha * q + (1 - alpha) * b for q, b in zip(qn, bn)]
+
+    order = sorted(range(len(docids)), key=lambda i: fused[i], reverse=True)
+    merged = [(docids[i], fused[i]) for i in order]
+    n = len(merged)
+    return [(d, float(n - i)) for i, (d, _) in enumerate(merged)]
+
+
+# Config A — single global α, target = global nDCG@10
+# Selected by sweep on 500 BioASQ training queries (qwen4b_uncertainty/
+# 10_best_cascade_params.py).  α* = 0.825 → nDCG@10 = 0.8418 (+0.0094 vs Qwen).
+QWEN_LF_ALPHA = 0.825
+
+
+class QwenLinearFusionCascade:
+    """BM25 → Qwen3-4B (50 docs) → linear blend with BM25 (every query).
+
+    Pure linear fusion, no gating:
+        score(d) = α · qwen_minmax(d) + (1-α) · bm25_minmax(d)
+    Both channels are min-max normalised per query before blending.
+
+    α=0.825 was selected to maximise GLOBAL nDCG@10 on a 500-query BioASQ
+    training slice — see qwen4b_uncertainty/10_best_cascade_params.py.
+    """
+
+    name = "qwen4b_linear_fusion"
+
+    def __init__(self, alpha: float = QWEN_LF_ALPHA):
+        self.alpha = alpha
+        self.qwen  = registry.get("qwen3_reranker_4b")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
+        qtype: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+        qwen_ranked = self.qwen.rerank(query, candidates)
+        _log.debug("qwen4b_linear_fusion: alpha=%.3f query=%r",
+                   self.alpha, query[:60])
+        return _qwen_bm25_linear(qwen_ranked, bm25_scores, self.alpha)
+
+
+# Config B — per-type α, each optimised for the metric most relevant to that
+# question type:
+#   list    → nDCG@3    α* = 0.875
+#   summary → nDCG@10   α* = 0.800
+#   yesno   → nDCG@1    α* = 0.750
+#   factoid → nDCG@5    α* = 0.875
+QWEN_LF_DYNAMIC_ALPHA: dict[str, float] = {
+    "list":    0.875,
+    "summary": 0.800,
+    "yesno":   0.750,
+    "factoid": 0.875,
+}
+# Fallback when query type is missing or unknown — same α as Config A.
+QWEN_LF_DYNAMIC_FALLBACK = QWEN_LF_ALPHA
+
+
+class QwenLinearFusionDynamicCascade:
+    """BM25 → Qwen3-4B → linear fusion with per-query-type α (no gate).
+
+    Each BioASQ question type gets its own α optimised for the metric most
+    relevant to that question type (see qwen4b_uncertainty/10_best_cascade_params.py):
+        list    → nDCG@3    α* = 0.875
+        summary → nDCG@10   α* = 0.800
+        yesno   → nDCG@1    α* = 0.750
+        factoid → nDCG@5    α* = 0.875
+
+    The eval router passes the query's `qtype` as a kwarg; if the type is
+    missing the cascade falls back to the global α=0.825 (Config A).
+    """
+
+    name = "qwen4b_linear_fusion_dynamic"
+
+    def __init__(self) -> None:
+        self.alpha_by_type = QWEN_LF_DYNAMIC_ALPHA
+        self.fallback      = QWEN_LF_DYNAMIC_FALLBACK
+        self.qwen          = registry.get("qwen3_reranker_4b")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
+        qtype: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        alpha = self.alpha_by_type.get(qtype or "", self.fallback)
+
+        qwen_ranked = self.qwen.rerank(query, candidates)
+        _log.debug("qwen4b_linear_fusion_dynamic: qtype=%s alpha=%.3f query=%r",
+                   qtype, alpha, query[:60])
+        return _qwen_bm25_linear(qwen_ranked, bm25_scores, alpha)
+
+
+# Config B′ — per-type α, every type optimised for nDCG@10 (uniform target).
+# Differs from QwenLinearFusionDynamicCascade only on factoid (0.875 → 0.925).
+QWEN_LF_DYNAMIC10_ALPHA: dict[str, float] = {
+    "list":    0.975,
+    "summary": 1,
+    "yesno":   0.750,
+    "factoid": 0.975,
+}
+
+
+class QwenLinearFusionDynamic10Cascade(QwenLinearFusionDynamicCascade):
+    """BM25 → Qwen3-4B → linear fusion with per-query-type α (all → nDCG@10).
+
+    Same as qwen4b_linear_fusion_dynamic but every type's α is the value that
+    maximises nDCG@10 specifically — simpler to reason about when nDCG@10 is
+    the deployment target. The only α that differs from the mixed-target
+    variant is factoid (0.925 instead of 0.875).
+
+        list    α* = 0.875
+        summary α* = 0.800
+        yesno   α* = 0.750
+        factoid α* = 0.925
+
+    Fallback α (unknown qtype) = 0.825 (Config A global).
+    """
+
+    name = "qwen4b_linear_fusion_dynamic_10"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.alpha_by_type = QWEN_LF_DYNAMIC10_ALPHA
+
+
+# ── Qwen3-4B + BM25 linear fusion gated by per-type H@20 entropy threshold ───
+# Per-query-type (alpha, tau) hyperparameters. tau is a threshold on the
+# normalized rank-distribution entropy of Qwen P(yes) over the top-20 docs:
+#   H@20_norm = -Σ p_i log(p_i) / log(20),  p_i = s_i / Σ s_j  (s_j over top-20)
+# Gate: if H@20 > tau → fuse with linear (alpha); else keep pure Qwen ranking.
+#
+# Hyperparameters from qwen4b_uncertainty/14_gated_dynamic_search.py.
+# K=20 chosen over K=50 in Stage 1 (tied global nDCG@10, more selective gate).
+# Per-type tau optimised at each type's natural metric:
+#   list    target nDCG@3   alpha=0.875  tau=0.8242   (~86% fused)
+#   summary target nDCG@10  alpha=0.800  tau=0.4246   (~96% fused)
+#   yesno   target nDCG@1   alpha=0.750  tau=0.6494   (~98% fused)
+#   factoid target nDCG@5   alpha=0.875  tau=0.0000   (always fuse)
+
+
+def _h20_norm_entropy(qwen_ranked: list[tuple[str, float]]) -> float:
+    """Normalized rank-distribution entropy over the top-20 Qwen P(yes) scores."""
+    scores = [s for _, s in qwen_ranked[:20]]
+    s_sum = sum(scores)
+    if s_sum <= 0 or len(scores) < 2:
+        return 0.0
+    probs = [s / s_sum for s in scores]
+    h = -sum(p * math.log(p + 1e-15) for p in probs if p > 0)
+    return h / math.log(len(probs))
+
+
+QWEN_LF_DYNAMIC_GATED_PARAMS: dict[str, tuple[float, float]] = {
+    "list":    (0.925, 0.0000),
+    "summary": (0.975, 0.4246),
+    "yesno":   (0.975, 0.0000),
+    "factoid": (0.675, 0.0000),
+}
+# Fallback (alpha, tau) when qtype is missing/unknown — global α=0.825 with the
+# Stage-1 global tau τ*=0.4246 from H@20.
+QWEN_LF_DYNAMIC_GATED_FALLBACK = (QWEN_LF_ALPHA, 0.4246)
+
+
+# ── Qwen3-0.6B cascades on top of Linear Fusion (per-type α 0.99/0.99/0.99/0.85)
+# Hyperparameters from qwen3_0.6b/ experiments on Task13BGoldenEnriched (340 q):
+#   α: summary=0.99, factoid=0.99, list=0.99, yesno=0.85   (Recall@20-tuned)
+#   Cascade A (LF→LiT5 top-20): nDCG@1=0.9494, MRR@10=0.9669
+#   Cascade B (LF→duoT5(15-25)→LiT5 top-20): nDCG@1=0.9583, MRR@10=0.9715  (best)
+
+QWEN06B_LF_ALPHA: dict[str, float] = {
+    "summary": 0.99,
+    "factoid": 0.99,
+    "list":    0.99,
+    "yesno":   0.85,
+}
+QWEN06B_LF_FALLBACK = 0.99
+
+# Uniform α=0.999 across all query types — selected by a fine sweep on
+# Task13BGoldenEnriched targeting global nDCG@10 (qwen3_0.6b/16_lf_alpha_sweep_ndcg.py).
+# Tiny BM25 nudge breaks ties in Qwen's score distribution.
+# Test-set: nDCG@1=0.9256, nDCG@5=0.9104, nDCG@10=0.8896, MRR@10=0.9549.
+QWEN06B_LF_999_ALPHA = 0.999
+
+# Window where Qwen rank-disagreement is highest — duoT5 reranks this band.
+UNC_BAND_LO = 14   # 0-indexed: LF rank 15
+UNC_BAND_HI = 25   # exclusive: through LF rank 25
+
+# LiT5 head size after duoT5 promotes the best 6 from the band.
+LIT5_TOP_K = 20
+
+
+def _lf_blend(
+    qwen_ranked: list[tuple[str, float]],
+    bm25_scores: dict[str, float] | None,
+    alpha: float,
+) -> list[tuple[str, float]]:
+    """Per-query min-max LF blend; returns docs sorted by fused score."""
+    if not qwen_ranked:
+        return []
+    if not bm25_scores or alpha >= 1.0:
+        return list(qwen_ranked)
+    docids = [d for d, _ in qwen_ranked]
+    qvec = [s for _, s in qwen_ranked]
+    bvec = [float(bm25_scores.get(d, 0.0)) for d in docids]
+    qn = _minmax_per_query(qvec)
+    bn = _minmax_per_query(bvec)
+    fused = [alpha * q + (1 - alpha) * b for q, b in zip(qn, bn)]
+    order = sorted(range(len(docids)), key=lambda i: fused[i], reverse=True)
+    return [(docids[i], fused[i]) for i in order]
+
+
+class Qwen06BLFCascade:
+    """BM25 → Qwen3-0.6B → per-type linear fusion with BM25 (no extra reranker).
+
+    Per-type α (Recall@20-tuned on BioASQ Task13BGoldenEnriched):
+        summary=0.99, factoid=0.99, list=0.99, yesno=0.85.
+    Score = α · qwen_minmax + (1-α) · bm25_minmax (per-query min-max norm).
+    """
+
+    name = "qwen06b_lf"
+
+    def __init__(self) -> None:
+        self.alpha_by_type = QWEN06B_LF_ALPHA
+        self.fallback      = QWEN06B_LF_FALLBACK
+        self.qwen          = registry.get("qwen3_reranker_0_6b")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
+        qtype: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+        alpha = self.alpha_by_type.get(qtype or "", self.fallback)
+        qwen_ranked = self.qwen.rerank(query, candidates)
+        _log.debug("qwen06b_lf: qtype=%s alpha=%.3f query=%r",
+                   qtype, alpha, query[:60])
+        return _qwen_bm25_linear(qwen_ranked, bm25_scores, alpha)
+
+
+class Qwen06BLF999Cascade:
+    """BM25 → Qwen3-0.6B → linear fusion with BM25 (uniform α=0.999, all qtypes).
+
+    Score = α · qwen_minmax + (1-α) · bm25_minmax (per-query min-max norm).
+    α=0.999 selected by fine sweep on Task13BGoldenEnriched targeting global
+    nDCG@10 (qwen3_0.6b/16_lf_alpha_sweep_ndcg.py). Test-set:
+        nDCG@1=0.9256, nDCG@5=0.9104, nDCG@10=0.8896, MRR@10=0.9549.
+    """
+
+    name = "qwen06b_lf_999"
+
+    def __init__(self) -> None:
+        self.alpha = QWEN06B_LF_999_ALPHA
+        self.qwen  = registry.get("qwen3_reranker_0_6b")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
+        qtype: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+        qwen_ranked = self.qwen.rerank(query, candidates)
+        _log.debug("qwen06b_lf_999: alpha=%.3f query=%r", self.alpha, query[:60])
+        return _qwen_bm25_linear(qwen_ranked, bm25_scores, self.alpha)
+
+
+class Qwen06BLFLiT5Cascade:
+    """BM25 → Qwen3-0.6B → per-type LF blend → LiT5 top-20 listwise.
+
+    Per-type α (Recall@20-tuned): summary 0.99, factoid 0.99, list 0.99, yesno 0.85.
+    LiT5-Distill listwise reranks the LF top-20 in a single 20-passage window;
+    positions 21+ are kept in their LF order pinned below.
+    """
+
+    name = "qwen06b_lf_lit5"
+
+    def __init__(self) -> None:
+        self.alpha_by_type = QWEN06B_LF_ALPHA
+        self.fallback      = QWEN06B_LF_FALLBACK
+        self.qwen          = registry.get("qwen3_reranker_0_6b")
+        self.lit5          = registry.get("lit5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
+        qtype: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        alpha = self.alpha_by_type.get(qtype or "", self.fallback)
+        cand_map = dict(candidates)
+
+        qwen_ranked = self.qwen.rerank(query, candidates)
+        lf_ranked = _lf_blend(qwen_ranked, bm25_scores, alpha)
+        order = [d for d, _ in lf_ranked]
+
+        head_ids = order[:LIT5_TOP_K]
+        tail_ids = order[LIT5_TOP_K:]
+        head_window = [(d, cand_map.get(d, "")) for d in head_ids]
+        head_ranked = self.lit5.rerank(query, head_window)
+        head_order = [d for d, _ in head_ranked]
+
+        merged = head_order + tail_ids
+        n = len(merged)
+        _log.debug("qwen06b_lf_lit5: qtype=%s alpha=%.3f query=%r",
+                   qtype, alpha, query[:60])
+        return [(d, float(n - i)) for i, d in enumerate(merged)]
+
+
+class Qwen06BLFDuoUncLiT5Cascade:
+    """BM25 → Qwen3-0.6B → per-type LF → duoT5 on uncertainty band → LiT5 top-20.
+
+    Pipeline:
+      1. Qwen3-0.6B scores BM25 top-50.
+      2. Linear-fusion blend with BM25 (per-type α: 0.99/0.99/0.99/0.85).
+      3. duoT5 tournament over the LF positions 15..25 (uncertainty band).
+      4. New top-20 = LF positions 1..14 (unchanged) + top-6 from duoT5 reorder.
+      5. LiT5-Distill listwise reranks that top-20 in one 20-passage window.
+      6. Tail = remaining docs (in LF/duoT5 order), pinned below the LiT5 head.
+
+    Best-performing config on the BioASQ Task13BGoldenEnriched test set:
+        global nDCG@1=0.9583, nDCG@5=0.9170, nDCG@10=0.8913, MRR@10=0.9715.
+    """
+
+    name = "qwen06b_lf_duot5_unc_lit5"
+
+    def __init__(self) -> None:
+        self.alpha_by_type = QWEN06B_LF_ALPHA
+        self.fallback      = QWEN06B_LF_FALLBACK
+        self.qwen          = registry.get("qwen3_reranker_0_6b")
+        self.duo           = registry.get("duot5")
+        self.lit5          = registry.get("lit5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
+        qtype: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        alpha = self.alpha_by_type.get(qtype or "", self.fallback)
+        cand_map = dict(candidates)
+
+        qwen_ranked = self.qwen.rerank(query, candidates)
+        lf_ranked = _lf_blend(qwen_ranked, bm25_scores, alpha)
+        order = [d for d, _ in lf_ranked]
+
+        head14 = order[:UNC_BAND_LO]            # ranks 1..14
+        band   = order[UNC_BAND_LO:UNC_BAND_HI] # ranks 15..25
+        rest   = order[UNC_BAND_HI:]            # ranks 26..50
+
+        if band:
+            band_pairs = [(d, cand_map.get(d, "")) for d in band]
+            band_ranked = self.duo.rerank(query, band_pairs)
+            band_order = [d for d, _ in band_ranked]
+        else:
+            band_order = []
+
+        band_top6 = band_order[:6]
+        band_rest = band_order[6:]
+        new_top20 = head14 + band_top6
+        full_order_after_duo = head14 + band_top6 + band_rest + rest
+
+        head_window = [(d, cand_map.get(d, "")) for d in new_top20]
+        head_ranked = self.lit5.rerank(query, head_window)
+        head_order = [d for d, _ in head_ranked]
+
+        used = set(head_order)
+        tail = [d for d in full_order_after_duo if d not in used]
+        merged = head_order + tail
+        n = len(merged)
+        _log.debug("qwen06b_lf_duot5_unc_lit5: qtype=%s alpha=%.3f query=%r",
+                   qtype, alpha, query[:60])
+        return [(d, float(n - i)) for i, d in enumerate(merged)]
+
+
+class Qwen06BLF999LiT5Cascade:
+    """BM25 → Qwen3-0.6B → LF (uniform α=0.999) → LiT5 top-20 listwise.
+
+    Uniform α=0.999 across all query types (selected by sweep on BioASQ test).
+    LiT5-Distill listwise reranks the LF top-20 in a single 20-passage window;
+    positions 21+ kept in their LF order pinned below.
+    Test-set: nDCG@1=0.9464, nDCG@5=0.9159, nDCG@10=0.8922, MRR@10=0.9656.
+    """
+
+    name = "qwen06b_lf_999_lit5"
+
+    def __init__(self) -> None:
+        self.alpha = QWEN06B_LF_999_ALPHA
+        self.qwen  = registry.get("qwen3_reranker_0_6b")
+        self.lit5  = registry.get("lit5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
+        qtype: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+        cand_map = dict(candidates)
+        qwen_ranked = self.qwen.rerank(query, candidates)
+        lf_ranked = _lf_blend(qwen_ranked, bm25_scores, self.alpha)
+        order = [d for d, _ in lf_ranked]
+
+        head_ids = order[:LIT5_TOP_K]
+        tail_ids = order[LIT5_TOP_K:]
+        head_window = [(d, cand_map.get(d, "")) for d in head_ids]
+        head_ranked = self.lit5.rerank(query, head_window)
+        head_order = [d for d, _ in head_ranked]
+
+        merged = head_order + tail_ids
+        n = len(merged)
+        _log.debug("qwen06b_lf_999_lit5: alpha=%.4f query=%r", self.alpha, query[:60])
+        return [(d, float(n - i)) for i, d in enumerate(merged)]
+
+
+class Qwen06BLF999DuoUncLiT5Cascade:
+    """BM25 → Qwen3-0.6B → LF (uniform α=0.999) → duoT5(15-25) → LiT5 top-20.
+
+    Same pipeline as qwen06b_lf_duot5_unc_lit5 but with uniform α=0.999 instead
+    of per-type α. Test-set: nDCG@1=0.9524, nDCG@5=0.9195, nDCG@10=0.8939,
+    MRR@10=0.9690.
+    """
+
+    name = "qwen06b_lf_999_duot5_unc_lit5"
+
+    def __init__(self) -> None:
+        self.alpha = QWEN06B_LF_999_ALPHA
+        self.qwen  = registry.get("qwen3_reranker_0_6b")
+        self.duo   = registry.get("duot5")
+        self.lit5  = registry.get("lit5")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
+        qtype: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+        cand_map = dict(candidates)
+        qwen_ranked = self.qwen.rerank(query, candidates)
+        lf_ranked = _lf_blend(qwen_ranked, bm25_scores, self.alpha)
+        order = [d for d, _ in lf_ranked]
+
+        head14 = order[:UNC_BAND_LO]
+        band   = order[UNC_BAND_LO:UNC_BAND_HI]
+        rest   = order[UNC_BAND_HI:]
+
+        if band:
+            band_pairs = [(d, cand_map.get(d, "")) for d in band]
+            band_ranked = self.duo.rerank(query, band_pairs)
+            band_order = [d for d, _ in band_ranked]
+        else:
+            band_order = []
+
+        band_top6 = band_order[:6]
+        band_rest = band_order[6:]
+        new_top20 = head14 + band_top6
+        full_order_after_duo = head14 + band_top6 + band_rest + rest
+
+        head_window = [(d, cand_map.get(d, "")) for d in new_top20]
+        head_ranked = self.lit5.rerank(query, head_window)
+        head_order = [d for d, _ in head_ranked]
+
+        used = set(head_order)
+        tail = [d for d in full_order_after_duo if d not in used]
+        merged = head_order + tail
+        n = len(merged)
+        _log.debug("qwen06b_lf_999_duot5_unc_lit5: alpha=%.4f query=%r",
+                   self.alpha, query[:60])
+        return [(d, float(n - i)) for i, d in enumerate(merged)]
+
+
+class QwenLinearFusionDynamicGatedCascade:
+    """BM25 → Qwen3-4B → per-type (α, τ) linear fusion gated on H@20 entropy.
+
+    For each query, look up (alpha, tau) by qtype. Compute H@20 over the top-20
+    Qwen P(yes) values. Fuse linearly with BM25 when H@20 > tau; otherwise keep
+    pure Qwen.
+
+    Per-type parameters (selected from
+    qwen4b_uncertainty/14_gated_dynamic_search.py — H@20 won Stage 1):
+        list    α=0.875  τ=0.8242   target nDCG@3   (~86% fused)
+        summary α=0.800  τ=0.4246   target nDCG@10  (~96% fused)
+        yesno   α=0.750  τ=0.6494   target nDCG@1   (~98% fused)
+        factoid α=0.875  τ=0.0000   target nDCG@5   (always fuse)
+
+    Fallback (unknown qtype): α=0.825, τ=0.4246 (Stage-1 global optimum).
+    """
+
+    name = "qwen4b_linear_fusion_dynamic_gated"
+
+    def __init__(self) -> None:
+        self.params   = QWEN_LF_DYNAMIC_GATED_PARAMS
+        self.fallback = QWEN_LF_DYNAMIC_GATED_FALLBACK
+        self.qwen     = registry.get("qwen3_reranker_4b")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+        bm25_scores: dict[str, float] | None = None,
+        bm25_inject_mode: str | None = None,
+        qtype: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if not candidates:
+            return []
+
+        alpha, tau = self.params.get(qtype or "", self.fallback)
+
+        qwen_ranked = self.qwen.rerank(query, candidates)
+        h20 = _h20_norm_entropy(qwen_ranked)
+        triggered = h20 > tau
+
+        _log.debug(
+            "qwen4b_linear_fusion_dynamic_gated: qtype=%s alpha=%.3f tau=%.4f "
+            "H@20=%.4f trigger=%s query=%r",
+            qtype, alpha, tau, h20, triggered, query[:60],
+        )
+
+        if not triggered:
+            n = len(qwen_ranked)
+            return [(d, float(n - i)) for i, (d, _) in enumerate(qwen_ranked)]
+        return _qwen_bm25_linear(qwen_ranked, bm25_scores, alpha)

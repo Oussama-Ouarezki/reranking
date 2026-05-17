@@ -14,6 +14,8 @@ from .routers import queries as queries_router
 from .routers import chat as chat_router
 from .routers import eval as eval_router
 from .routers import generation as generation_router
+from .routers import statistical as statistical_router
+from .routers import failure as failure_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("rag-app")
@@ -49,6 +51,8 @@ app.include_router(queries_router.router, prefix="/api")
 app.include_router(chat_router.router, prefix="/api")
 app.include_router(eval_router.router, prefix="/api")
 app.include_router(generation_router.router, prefix="/api")
+app.include_router(statistical_router.router, prefix="/api")
+app.include_router(failure_router.router, prefix="/api")
 
 
 @app.get("/api/health")

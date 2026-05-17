@@ -148,17 +148,47 @@ SUMMARY_KS = (1, 3, 5, 10, 20)
 
 
 def _gen_run_summary_cell(d: dict) -> dict:
-    """Compact per-(model, k) cell with the metrics the UI table can display."""
+    """Compact per-(model, k) cell with the metrics the UI table can display.
+
+    All averages are restricted to the *evaluated set*: queries that have both
+    a question type AND qrels (so ``retrieval_metrics`` was computed for them).
+    Without this filter, QA scores would average over more queries (everything
+    with a type) than retrieval metrics (qrels-eligible only) and the two
+    columns on the same row would not be directly comparable.
+    """
     agg = d.get("aggregate") or {}
     per_query = d.get("per_query") or {}
 
+    # Evaluated set: entries with both a qa_score AND retrieval_metrics.
+    evaluated = [
+        e for e in per_query.values()
+        if e.get("retrieval_metrics") is not None
+    ]
+    n_evaluated = len(evaluated)
+
     qa_scores = [
-        float(e["qa_score"]) for e in per_query.values() if e.get("qa_score") is not None
+        float(e["qa_score"]) for e in evaluated if e.get("qa_score") is not None
     ]
     qa_overall = round(sum(qa_scores) / len(qa_scores), 4) if qa_scores else None
 
+    # Per-qtype QA averages over the evaluated set (replaces saved agg.by_qtype
+    # which averaged over the full per_query set including no-qrels entries).
+    qa_sums: dict[str, float] = {}
+    qa_counts: dict[str, int] = {}
+    for e in evaluated:
+        s = e.get("qa_score")
+        t = e.get("qtype")
+        if s is None or not t:
+            continue
+        qa_sums[t] = qa_sums.get(t, 0.0) + float(s)
+        qa_counts[t] = qa_counts.get(t, 0) + 1
+    qa_by_qtype = {
+        t: round(qa_sums[t] / qa_counts[t], 4) for t in qa_sums if qa_counts[t] > 0
+    }
+    n_per_qtype = dict(qa_counts)
+
     rsums: dict[str, list[float]] = {"ndcg": [], "p": [], "r": [], "mrr": [], "map": []}
-    for e in per_query.values():
+    for e in evaluated:
         rm = e.get("retrieval_metrics") or {}
         for mk in rsums:
             v = rm.get(mk)
@@ -166,42 +196,46 @@ def _gen_run_summary_cell(d: dict) -> dict:
                 rsums[mk].append(float(v))
     retrieval = {mk: round(sum(vs) / len(vs), 4) if vs else None for mk, vs in rsums.items()}
 
-    extra_by_qtype = (agg.get("extra_by_qtype") or {})
-    summary_extras = extra_by_qtype.get("summary") or {}
-    factoid_extras = dict(extra_by_qtype.get("factoid") or {})
-    list_extras = dict(extra_by_qtype.get("list") or {})
-
-    # Backfill strict_acc / list_map for older cached runs that pre-date them.
-    if "strict_acc" not in factoid_extras:
-        vals = [
-            float(e["extra_metrics"]["strict_acc"])
-            for e in per_query.values()
-            if e.get("qtype") == "factoid"
-            and (e.get("extra_metrics") or {}).get("strict_acc") is not None
-        ]
-        if vals:
-            factoid_extras["strict_acc"] = round(sum(vals) / len(vals), 4)
-    if "map" not in list_extras:
-        vals = [
-            float(e["extra_metrics"]["map"])
-            for e in per_query.values()
-            if e.get("qtype") == "list"
-            and (e.get("extra_metrics") or {}).get("map") is not None
-        ]
-        if vals:
-            list_extras["map"] = round(sum(vals) / len(vals), 4)
+    # Per-qtype extras, also computed on the evaluated set so they match.
+    summary_rouge_vals = [
+        float((e.get("extra_metrics") or {}).get("rouge_l"))
+        for e in evaluated
+        if e.get("qtype") == "summary"
+        and (e.get("extra_metrics") or {}).get("rouge_l") is not None
+    ]
+    summary_bert_vals = [
+        float((e.get("extra_metrics") or {}).get("bert_score"))
+        for e in evaluated
+        if e.get("qtype") == "summary"
+        and (e.get("extra_metrics") or {}).get("bert_score") is not None
+    ]
+    factoid_strict_vals = [
+        float((e.get("extra_metrics") or {}).get("strict_acc"))
+        for e in evaluated
+        if e.get("qtype") == "factoid"
+        and (e.get("extra_metrics") or {}).get("strict_acc") is not None
+    ]
+    list_map_vals = [
+        float((e.get("extra_metrics") or {}).get("map"))
+        for e in evaluated
+        if e.get("qtype") == "list"
+        and (e.get("extra_metrics") or {}).get("map") is not None
+    ]
+    _mean = lambda vs: round(sum(vs) / len(vs), 4) if vs else None
     skip_judge = bool((d.get("config") or {}).get("skip_judge", False))
 
     return {
         "run_id": d.get("run_id"),
         "n_queries": len(per_query),
+        "n_evaluated": n_evaluated,
         "qa_overall": qa_overall,
-        "qa_by_qtype": agg.get("by_qtype") or {},
+        "qa_by_qtype": qa_by_qtype,
+        "n_per_qtype": n_per_qtype,
         "retrieval": retrieval,
-        "summary_rouge_l": summary_extras.get("rouge_l"),
-        "summary_bert_score": summary_extras.get("bert_score"),
-        "factoid_strict_acc": factoid_extras.get("strict_acc"),
-        "list_map": list_extras.get("map"),
+        "summary_rouge_l": _mean(summary_rouge_vals),
+        "summary_bert_score": _mean(summary_bert_vals),
+        "factoid_strict_acc": _mean(factoid_strict_vals),
+        "list_map": _mean(list_map_vals),
         "skip_judge": skip_judge,
         "elapsed_s": d.get("elapsed_s"),
         "comment": d.get("comment", ""),
@@ -537,6 +571,11 @@ async def generation_run(ws: WebSocket):
             continue
         q = queries_by_id[qid]
         if not q.get("type"):
+            continue
+        # Only run on queries with qrels so retrieval and QA averages share
+        # a denominator. Without this we'd also bill an LLM call for queries
+        # that can't contribute to retrieval-metric comparisons.
+        if qid not in qrels:
             continue
         if qtype_filter and q["type"] not in qtype_filter:
             continue

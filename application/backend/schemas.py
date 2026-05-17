@@ -78,6 +78,7 @@ class ChatRequest(BaseModel):
     history: list[ChatTurn] = []
     query_id: Optional[str] = None  # if from sidebar, lets us bypass type detection
     generate: bool = True  # set False to skip LLM call
+    skip_judge: bool = False  # skip LLM-as-judge scoring for summary qtype
 
 
 class RetrievedDoc(BaseModel):
@@ -116,6 +117,10 @@ class ChatResponse(BaseModel):
     metrics: Optional[RankingMetrics] = None  # only when query_id has qrels
     timings: Optional[Timings] = None
     n_relevant_retrieved: int = 0  # gold docs found within top_k
+    # QA scoring for the generated answer (only when query_id has gold answers).
+    qa_score: Optional[float] = None
+    qa_metric_label: Optional[str] = None  # "MRR" | "Acc" | "F1" | "Judge"
+    qa_extra: Optional[dict] = None  # rouge_l, bert_score, strict_acc, list_map…
 
 
 class EvalRequest(BaseModel):

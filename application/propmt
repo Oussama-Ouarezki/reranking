@@ -1,0 +1,582 @@
+### Purpose
+
+- **Research pipeline:** batch experiments, fine-tuning, evaluation
+    
+- **Application:** real-time retrieval, reranking, generation dashboard
+    
+
+---
+
+# Backend Architecture (`application/backend/`)
+
+```text
+backend/
+├── main.py
+├── config.py
+├── deps.py
+├── schemas.py
+│
+├── retrieval/
+│   ├── bm25.py
+│   └── corpus.py
+│
+├── rerankers/
+│   ├── base.py
+│   ├── registry.py
+│   ├── monot5.py
+│   ├── duot5.py
+│   ├── lit5.py
+│   └── cascade.py
+│
+├── generation/
+│   ├── ollama_client.py
+│   ├── prompts.py
+│   └── rag.py
+│
+├── evaluation/
+│   ├── ranking.py
+│   ├── qa_metrics.py
+│   └── correlation.py
+│
+└── routers/
+    ├── queries.py
+    ├── chat.py
+    ├── eval.py
+    └── generation.py
+```
+
+---
+
+# Core Backend Files
+
+## `main.py`
+
+### Purpose
+
+- FastAPI app entry point
+    
+- Loads:
+    
+    - BM25
+        
+    - Corpus
+        
+    - Queries
+        
+    - Qrels
+        
+
+### Benefit
+
+- Startup cost paid once
+    
+- Faster runtime requests
+    
+
+---
+
+## `config.py`
+
+### Stores
+
+- Paths
+    
+- Hyperparameters
+    
+- Model checkpoints
+    
+- Ollama URL
+    
+- BM25 settings
+    
+
+---
+
+## `deps.py`
+
+### Purpose
+
+Singleton shared objects using `@lru_cache`
+
+### Shared resources
+
+- BM25 searcher
+    
+- Corpus
+    
+- Queries
+    
+- Qrels
+    
+
+### Benefit
+
+- Prevents reloading resources
+    
+- Shared across all routers
+    
+
+---
+
+## `schemas.py`
+
+### Purpose
+
+- Defines request/response models
+    
+- Uses Pydantic validation
+    
+
+---
+
+# Retrieval Layer
+
+## `bm25.py`
+
+### Function
+
+- Pyserini BM25 wrapper
+    
+- Query → top-k documents
+    
+
+---
+
+## `corpus.py`
+
+### Function
+
+- Loads `corpus_full.jsonl`
+    
+- Retrieves document text by docid
+    
+
+---
+
+# Reranking Layer
+
+## `base.py`
+
+### Purpose
+
+- Defines reranker interface
+    
+
+---
+
+## `registry.py`
+
+### Purpose
+
+- Lazy loads models
+    
+- Caches GPU models
+    
+- Singleton access
+    
+
+---
+
+## Available Rerankers
+
+### `monot5.py`
+
+- Pointwise reranker
+    
+
+### `duot5.py`
+
+- Pairwise reranker
+    
+
+### `lit5.py`
+
+- Listwise FiD reranker
+    
+
+### `cascade.py`
+
+- monoT5 → duoT5 hybrid
+    
+
+---
+
+# Generation Layer
+
+## `ollama_client.py`
+
+### Purpose
+
+- Connects to local Ollama
+    
+- Handles streaming generation
+    
+
+---
+
+## `prompts.py`
+
+### Contains
+
+Prompt templates for:
+
+- Factoid
+    
+- Yes/No
+    
+- List
+    
+- Summary
+    
+
+---
+
+## `rag.py`
+
+### Function
+
+- Builds context from retrieved docs
+    
+- Sends prompt + context to LLM
+    
+- Returns generated answer
+    
+
+---
+
+# Evaluation Layer
+
+## `ranking.py`
+
+### Metrics
+
+- nDCG
+    
+- Recall
+    
+- MRR
+    
+
+---
+
+## `qa_metrics.py`
+
+### Metrics by question type
+
+- Factoid → MRR
+    
+- Yes/No → Accuracy
+    
+- List → F1
+    
+- Summary → LLM Judge
+    
+
+---
+
+## `correlation.py`
+
+### Purpose
+
+- Computes Spearman correlations
+    
+- No external scipy dependency
+    
+
+---
+
+# API Routers
+
+## `queries.py`
+
+### Endpoint
+
+```text
+GET /api/queries
+```
+
+### Purpose
+
+Returns all BioASQ queries
+
+---
+
+## `chat.py`
+
+### Endpoint
+
+```text
+WS /api/chat
+```
+
+### Purpose
+
+Single interactive RAG query
+
+---
+
+## `eval.py`
+
+### Endpoint
+
+```text
+WS /api/eval/run
+```
+
+### Purpose
+
+Bulk retrieval evaluation
+
+---
+
+## `generation.py`
+
+### Endpoint
+
+```text
+WS /api/generation/run
+```
+
+### Purpose
+
+Runs generation stage + QA metrics
+
+---
+
+# Cache System (`application/cache/`)
+
+```text
+cache/
+├── eval_results.json
+├── runs/
+│   ├── bm25/
+│   ├── monot5/
+│   └── lit5/
+└── gen_runs/
+    └── <retrieval_run_id>/
+        └── k<k>_<timestamp>.json
+```
+
+---
+
+## Purpose
+
+### Retrieval stage
+
+Stores ranked document runs
+
+### Generation stage
+
+Stores:
+
+- Generated answers
+    
+- QA scores
+    
+- Correlation results
+    
+
+---
+
+# Frontend Architecture (`application/frontend/src/`)
+
+```text
+src/
+├── App.tsx
+├── lib/
+│   ├── api.ts
+│   ├── store.ts
+│   └── types.ts
+│
+├── pages/
+│   ├── ChatPage.tsx
+│   ├── DashboardPage.tsx
+│   └── GenerationPage.tsx
+│
+└── components/
+    ├── ChatInput.tsx
+    ├── ChatThread.tsx
+    ├── MetricCards.tsx
+    ├── ModelSidebar.tsx
+    └── QuerySidebar.tsx
+```
+
+---
+
+# Main Frontend Pages
+
+## `ChatPage`
+
+### Purpose
+
+- Interactive RAG chat
+    
+- Single-query mode
+    
+
+---
+
+## `DashboardPage`
+
+### Purpose
+
+- Select retrieval models
+    
+- Run evaluations
+    
+- Compare metrics
+    
+
+---
+
+## `GenerationPage`
+
+### Purpose
+
+- Select retrieval runs
+    
+- Test different k values
+    
+- View QA metrics + correlations
+    
+
+---
+
+# Shared Frontend Utilities
+
+## `api.ts`
+
+- HTTP requests
+    
+- WebSocket communication
+    
+
+---
+
+## `store.ts`
+
+- Global state management
+    
+
+---
+
+## `types.ts`
+
+- Shared TypeScript definitions
+    
+
+---
+
+# UI Components
+
+### `ChatInput`
+
+User question input
+
+### `ChatThread`
+
+Streaming conversation display
+
+### `MetricCards`
+
+Retrieval metrics dashboard
+
+### `ModelSidebar`
+
+Model selection
+
+### `QuerySidebar`
+
+Per-query exploration
+
+Here's the updated prompt with those additions folded in:
+
+---
+
+**Prompt to paste into Claude Code:**
+
+---
+
+You have full access to the codebase. Read all relevant existing files before making any changes — match existing patterns, component structure, naming conventions, and API conventions throughout. Do not break any existing pages or routers.
+
+---
+
+**0. Fix retrieval metrics inconsistency (do this first)**
+
+There is a known inconsistency in retrieval metrics between the Retrieval page and the Generation Comparison page. Investigate the root cause before touching anything — likely 4 queries are problematic (missing from qrels, malformed, or excluded during eval but included during generation, or vice versa).
+
+Steps:
+- Audit the data pipeline: compare the query sets used in retrieval eval vs generation runs and identify the mismatched queries
+- Check `cache/eval_results.json` and `cache/gen_runs/` for query count discrepancies
+- Fix the metric computation so both pages operate on the same consistent query set
+- If the 4 queries are legitimately excluded from retrieval eval, reflect that consistently in the generation comparison page too — do not mix query sets between pages
+- Add a clear note in the UI on both pages showing the effective query count used for metrics (e.g. "Metrics computed over 336 queries")
+
+---
+
+**1. ChatPage — add retrieval + generation metrics**
+
+Extend `ChatPage.tsx` so that after a query completes, it shows two collapsible metric sections below the chat thread:
+
+- Retrieval metrics: nDCG, Recall, MRR for the query
+- Generation metrics: the correct metric for the question type (Accuracy for yes/no, MRR for factoid, F1 for list, LLM-as-judge score for summary)
+
+Fetch from the existing eval and generation routers. Display as metric cards matching the style in `DashboardPage`. Show a graceful empty state if metrics are unavailable.
+
+---
+
+**2. Statistical Testing Page — new page**
+
+Create `StatisticalTestingPage.tsx` under `pages/` and register it in the router.
+
+Backend — add `routers/statistical.py`:
+- Accept two model run IDs and a scope (per query type or global)
+- Compute per-query metric deltas using the correct metric per type: Accuracy (yes/no), MRR (factoid), F1 (list), LLM-judge (summary)
+- Run a Wilcoxon signed-rank test — implement without scipy, consistent with how `correlation.py` avoids external deps
+- Return: p-value, test statistic, mean delta, win/loss/tie counts per query type, global aggregated result
+- Add schemas to `schemas.py`, inject dependencies via `deps.py`, register router in `main.py`
+
+Frontend:
+- Two model selectors + scope selector (per query type / global) + "Run test" button
+- Results: one summary card per query type + a global summary row
+- Highlight statistically significant results (p < 0.05)
+
+---
+
+**3. Failure Analysis Page — new page**
+
+Create `FailureAnalysisPage.tsx` under `pages/` and register it in the router.
+
+Backend — add `routers/failure.py`:
+- Accept two model run IDs (model A = baseline, model B = comparison)
+- Use cached generation data from `cache/gen_runs/` — do not re-run generation
+- Apply these failure thresholds per question type:
+  - Yes/No: Accuracy drop > 0 (binary flip)
+  - Factoid: MRR drop > 0.1
+  - List: F1 drop > 0.1
+  - Summary: LLM-judge score drop > 0.5
+- Return per-query failure records: query text, question type, model A score, model B score, delta, which model failed
+- Add schemas to `schemas.py`, inject via `deps.py`, register in `main.py`
+
+Frontend:
+- Two model selectors (A = baseline, B = comparison)
+- Aggregate failure count summary at the top
+- Failures grouped by question type
+- Per failure: query text, scores side by side, clear visual indicator of which model failed
+
+---
+
+**Application structure rules (follow strictly):**
+
+- All new routers go in `routers/`, follow the existing FastAPI + dependency injection pattern
+- All new Pydantic models go in `schemas.py`
+- All shared/cached objects use `deps.py` via `@lru_cache`
+- All new pages go in `pages/`, registered in the same router file as existing pages
+- New components go in `components/` if reusable across pages
+- Use `api.ts` for all HTTP/WebSocket calls from the frontend
+- Add any new TypeScript types to `types.ts`
+- Use `store.ts` for any global state
+- Match the existing metric card style, sidebar layout, and WebSocket streaming patterns used in `DashboardPage` and `GenerationPage`
+
+
+ask me more question and do what seems fits don't follow this prompt rigrously

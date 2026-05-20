@@ -1,0 +1,51 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body, #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-bg text-ink font-sans antialiased;
+    font-feature-settings: "ss01", "cv01";
+  }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center px-3 py-1.5 text-sm font-medium
+           rounded-md border border-border bg-panel hover:bg-bg
+           transition-all duration-150 disabled:opacity-50 disabled:cursor-not-allowed
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40;
+  }
+  .btn-primary {
+    @apply bg-accent text-white border-accent hover:bg-accent/90 hover:border-accent/90
+           shadow-sm;
+  }
+  .input {
+    @apply w-full px-3 py-2 text-sm bg-panel border border-border rounded-md
+           focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent
+           transition-shadow duration-150;
+  }
+  .chip {
+    @apply inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full
+           border border-border bg-panel text-muted;
+  }
+  .chip-active {
+    @apply bg-ink text-white border-ink;
+  }
+  .sidebar-item {
+    @apply block w-full text-left px-3 py-2.5 border-b border-border/50
+           hover:bg-bg transition-colors duration-100 cursor-pointer;
+  }
+  .sidebar-item-active {
+    @apply bg-bg border-l-2 border-l-accent pl-[10px];
+  }
+}
+
+/* Subtle scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { @apply bg-transparent; }
+::-webkit-scrollbar-thumb { @apply bg-border rounded-full; }
+::-webkit-scrollbar-thumb:hover { background: #c9c6c1; }

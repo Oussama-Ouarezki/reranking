@@ -900,7 +900,7 @@ def _qwen_bm25_linear(
 # Config A — single global α, target = global nDCG@10
 # Selected by sweep on 500 BioASQ training queries (qwen4b_uncertainty/
 # 10_best_cascade_params.py).  α* = 0.825 → nDCG@10 = 0.8418 (+0.0094 vs Qwen).
-QWEN_LF_ALPHA = 0.825
+QWEN_LF_ALPHA = 1
 
 
 class QwenLinearFusionCascade:

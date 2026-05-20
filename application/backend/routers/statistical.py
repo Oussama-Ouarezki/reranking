@@ -113,8 +113,7 @@ def wilcoxon_signed_rank(deltas: list[float]) -> dict:
         }
 
     # Continuity correction toward the mean.
-    w_ref = min(w_plus, w_minus)
-    diff = w_ref - mean_w
+    diff = w_plus - mean_w
     if diff > 0:
         diff -= 0.5
     elif diff < 0:

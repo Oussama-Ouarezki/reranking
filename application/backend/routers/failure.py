@@ -52,6 +52,12 @@ class FailureRecord(BaseModel):
     threshold: float
     answer_a: Optional[str] = None
     answer_b: Optional[str] = None
+    # Retrieval metrics @ k for each side, plus delta = b - a. Each is a dict
+    # with keys ndcg / p / r / mrr / map (or None if qrels weren't available).
+    # This lets the UI tell whether the QA failure tracks a retrieval gap.
+    retrieval_a: Optional[dict[str, float]] = None
+    retrieval_b: Optional[dict[str, float]] = None
+    retrieval_delta: Optional[dict[str, float]] = None
 
 
 class FailureBucket(BaseModel):
@@ -132,6 +138,27 @@ def compare(req: FailureRequest) -> FailureResponse:
         else:
             bucket.n_b_failed += 1
         bucket.n_failures += 1
+
+        rm_a = ea.get("retrieval_metrics")
+        rm_b = eb.get("retrieval_metrics")
+        retr_a = (
+            {k: round(float(v), 4) for k, v in rm_a.items() if v is not None}
+            if isinstance(rm_a, dict)
+            else None
+        )
+        retr_b = (
+            {k: round(float(v), 4) for k, v in rm_b.items() if v is not None}
+            if isinstance(rm_b, dict)
+            else None
+        )
+        retr_delta: Optional[dict[str, float]] = None
+        if retr_a is not None and retr_b is not None:
+            retr_delta = {
+                key: round(retr_b[key] - retr_a[key], 4)
+                for key in retr_a
+                if key in retr_b
+            }
+
         bucket.failures.append(
             FailureRecord(
                 qid=qid,
@@ -144,6 +171,9 @@ def compare(req: FailureRequest) -> FailureResponse:
                 threshold=threshold,
                 answer_a=ea.get("answer"),
                 answer_b=eb.get("answer"),
+                retrieval_a=retr_a,
+                retrieval_b=retr_b,
+                retrieval_delta=retr_delta,
             )
         )
 
